@@ -1,0 +1,8 @@
+- hamstrung with perms requests to cat <<'EOF' | uv run nb edit insert --md 13 - (mcp would be better as less reliance on heredoc?)
+- lots of insert then run cell X - we should consider a single command for both
+- sandboxing feels brittle, very reliant on having good mount paths for system
+- moving notebook causes crash on nb read status
+- status should be in sys not read
+- who shuts down the kernel and when - what is the impact of our lack of mgmt of it now - should we have a nuclear cleanup cli command
+- should be able to read and edit without a notebook open
+- "open" is a strange description given semantics, it's more like "up" or "start-kernel"

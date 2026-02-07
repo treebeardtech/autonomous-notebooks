@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run nb guide)",
+      "Bash(uv run nb sys:*)",
+      "Bash(uv run nb read:*)",
+      "Bash(uv run nb edit:*)",
+      "Bash(uv run nb sandbox:*)",
+      "Bash(uv run ruff:*)",
+      "Bash(uv run pyright:*)",
+      "Bash(just:*)",
+      "Bash(echo:*)",
+      "Bash(cat:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(stat:*)",
+      "Bash(du:*)",
+      "Bash(df:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(file:*)",
+      "Bash(env)",
+      "Bash(pwd)",
+      "WebSearch",
+      "Read(*)"
+    ]
+  }
+}
