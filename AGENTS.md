@@ -1,187 +1,101 @@
 # AGENTS.md
 ### Autonomous Notebook Agents
 
-Tools for agents to read, modify, and execute Jupyter notebooks — headless, no Jupyter server required. CLI first, MCP later.
+A stdio MCP server that lets an agent read, modify, and execute Jupyter notebooks headlessly. Kernels live inside the MCP server process and die with it.
 
 ---
 
 ## 1. Goals
 
-- Allow an agent to **read, modify, and execute** cells in a Jupyter notebook.
-- Work **headless** — no VS Code, no Jupyter server, no browser.
-- Produce **standard .ipynb files** that VS Code opens natively.
-- Keep execution **sandboxed** via a containerised kernel (later).
-- Keep agent context usage manageable.
-- **Later:** collaborative mode where human and agent share a live kernel via Jupyter server.
+- Agents can **read, modify, and execute** notebook cells through MCP tools.
+- **Headless** — no VS Code, no Jupyter server, no browser.
+- Produces **standard .ipynb** files.
+- **Stateless read/edit** — just `nbformat` against a path. No state file.
+- **Per-notebook kernels**, auto-started on first exec, tied to the MCP server's process lifecycle (i.e. Claude Code's).
 
 ---
 
 ## 2. Architecture
 
-### Current (Phase 1): CLI + direct kernel
-
 ```
-Agent  ──>  nb CLI  ──>  jupyter_client (kernel)
-                    ──>  nbformat (.ipynb read/write)
-```
-
-- `nb` CLI provides all notebook operations as subcommands.
-- `jupyter_client` starts and manages kernels directly (no server).
-- `nbformat` reads/writes standard .ipynb files.
-- Outputs are captured from the kernel and saved into notebook cells.
-- VS Code can open the resulting .ipynb at any time — zero install.
-
-### Later (Phase 2): MCP wrapper
-
-```
-Agent  ──>  MCP Server (stdio)  ──>  nb CLI / library
+Claude Code  ──stdio──>  nb MCP server (FastMCP)
+                          ├─ nb_io         (pure nbformat read/write)
+                          ├─ exec_runner   (streaming code execution)
+                          └─ kernels       ({notebook_path → ipykernel})
 ```
 
-- Thin MCP server wrapping the same operations as tools.
-- Enables use from Claude Desktop, Claude Code, or any MCP client.
-
-### Later (Phase 3): Collaborative mode
-
-```
-VS Code  ─────┐
-              │
-Jupyter Server  ←──  MCP Server / CLI  ←── Agent
-              │
-         ipykernel
-```
-
-- Shared Jupyter server for live collaboration.
-- Both human and agent see the same kernel state.
-- Requires Jupyter server to be running; optional enhancement.
+- `nb mcp` is the stdio entry point. Claude Code launches it as a subprocess.
+- Read/edit tools work against any `.ipynb` path without touching a kernel.
+- Exec tools call `kernels.get_or_start(path)` — first call starts a kernel, later calls reuse it.
+- When Claude Code exits, stdin closes / SIGTERM fires → `shutdown_all()` stops every kernel.
 
 ---
 
-## 3. What the CLI Can Do
+## 3. MCP tools
 
-Commands are grouped into permission tiers for agent access control:
+All tools take `notebook_path: str` as their first argument.
 
-```
-# Top-level
-nb guide                    # print agent reference
+**Read (kernel-free)**
+- `list_cells(notebook_path)`
+- `read_cell(notebook_path, index?, cell_id?)`
 
-# Sys tier — lifecycle
-nb sys open <path>              # set active notebook (starts kernel)
-nb sys open <path> --sandboxed  # sandboxed kernel (GPU on by default)
-nb sys open --sandboxed --no-gpu --podman-arg='--shm-size=8g'
-nb sys shutdown                 # stop kernel
-nb sys serve / nb sys unserve   # share/unshare kernel with VS Code
-nb sys restart                  # restart kernel with same settings
+**Edit (kernel-free, writes to disk)**
+- `insert_cell(notebook_path, index, source, markdown=False)`
+- `set_cell(notebook_path, source, index?, cell_id?, markdown=False)`
+- `delete_cell(notebook_path, index?, cell_id?)`
+- `clear_outputs(notebook_path, index?)`
 
-# Read tier — no side effects, auto-allowed
-nb read cells               # list all cells (compact)
-nb read cell <index>        # read one cell with outputs
-nb read peek <path>         # read-only cell listing from any notebook
-nb read status              # show kernel status, active notebook
+**Exec (auto-starts kernel)**
+- `exec_cell(notebook_path, index?, cell_id?, timeout=120)`
+- `exec_range(notebook_path, start, end, timeout=120)`
+- `exec_all(notebook_path, timeout=120)`
+- `run_scratch(notebook_path, code, timeout=120)` — ephemeral
+- `insert_and_exec(notebook_path, index, source, timeout=120)`
 
-# Edit tier — modifies notebook on disk
-nb edit insert <i> <src>    # insert a cell
-nb edit set <i> <src>       # overwrite cell source
-nb edit rm <i>              # delete a cell
-nb edit save                # save notebook to disk
-nb edit clear [<i>]         # clear outputs (all or one cell)
+**Kernel lifecycle**
+- `interrupt(notebook_path)`
+- `shutdown_kernel(notebook_path)`
 
-# Exec tier — runs code on kernel
-nb exec cell <i>            # execute a cell, capture output
-nb exec cell <start>:<end>  # execute range of cells
-nb exec all                 # execute all code cells (stop on error)
-nb exec run <code>          # execute scratch code (not saved)
-
-# Sandbox tier — exec, but errors if kernel not sandboxed
-nb sandbox cell <i>         # execute cell (sandboxed only)
-nb sandbox all              # execute all cells (sandboxed only)
-nb sandbox run <code>       # execute scratch code (sandboxed only)
-```
-
-The CLI manages kernel lifecycle automatically:
-- `nb sys open` starts a kernel if one isn't running.
-- Kernel connection info is persisted so subsequent commands reuse it.
-- `nb sys shutdown` stops the kernel and cleans up.
+The server also auto-creates empty `.ipynb` files on first touch, so `insert_cell(path_to_new_nb, 0, "…")` just works.
 
 ---
 
-## 4. Kernel Management
+## 4. CLI
 
-Kernels are managed via `jupyter_client` directly:
+Minimal. Primary interface is MCP.
 
-- **No Jupyter server needed** — kernels are started as subprocesses.
-- Connection files are stored in a known location (e.g. `.nb/`).
-- Kernel spec can be the default `python3` or a custom containerised one.
-- Kernel persists across CLI invocations (not per-command).
-
-### Containerised kernel (later)
-
-Custom kernelspec launching ipykernel inside Podman:
-
-```jsonc
-{
-  "argv": ["podman", "run", "...", "python", "-m", "ipykernel_launcher", "-f", "{connection_file}"],
-  "display_name": "Python (Sandboxed)",
-  "language": "python"
-}
+```
+nb mcp       # run the stdio MCP server
+nb cleanup   # kill stray ipykernel processes and delete .nb/
 ```
 
 ---
 
-## 5. Output Capture
+## 5. Output capture
 
-When executing a cell:
-
-1. Send cell source to kernel via `jupyter_client`.
-2. Collect all `execute_result`, `stream`, `display_data`, `error` messages.
-3. Convert to nbformat output objects.
-4. Attach outputs to the cell in the notebook data structure.
-5. Auto-save (or explicit `nb save`).
-
-This means the .ipynb file always reflects the latest execution state — open it in VS Code and everything is there.
+`exec_runner.execute_code` subscribes to the kernel's iopub channel and converts each message to an `nbformat` output dict: `stream`, `display_data`, `execute_result`, `error`. For cell execs, outputs are re-written to the `.ipynb` (by cell ID) after every message so the file on disk mirrors progress in real time.
 
 ---
 
-## 6. Keeping Context Usage Reasonable
+## 6. Interactive E2E check
 
-- `nb read cells` returns compact summaries (first line of source, truncated).
-- `nb read cell <i>` returns full source + outputs for one cell.
-- Outputs can be large — truncate or omit when not needed.
-- Prefer targeted reads over dumping the whole notebook.
+No full integration tests for the MCP loop. Quickest manual check:
 
----
+1. `.mcp.json` in the repo root, run Claude Code in-repo.
+2. `list_cells /tmp/demo.ipynb` — file is created, prints `(no cells)`.
+3. `insert_and_exec /tmp/demo.ipynb 0 "print('hello')"` — outputs captured.
+4. Open `/tmp/demo.ipynb` in VS Code — cell + output visible.
+5. `run_scratch /tmp/demo.ipynb "2 + 2"` — returns `4`.
+6. Exit Claude Code, then `ps -u $USER | grep ipykernel` — empty.
 
-## 7. Practical Workflow
-
-1. Agent runs `nb sys open path/to/notebook.ipynb`.
-2. Agent reads cells, inserts/edits code, executes cells.
-3. Outputs are captured and saved to the .ipynb.
-4. Human opens the .ipynb in VS Code later to review.
-5. Kernel can be left running or shut down.
-
-For unattended operation: run the agent in tmux/screen. The kernel and notebook persist independently of any terminal.
-
----
-
-## Interactive E2E Testing
-
-No automated integration tests for the full CLI+proxy flow — test interactively with the human:
-
-1. `nb sys open nbs/test.ipynb` — start kernel
-2. `nb edit insert <i> "print('hello')"` then `nb exec cell <i>` — verify output capture
-3. `nb sys serve` — install proxy kernelspec
-4. Human: in VS Code, reload window, select "Python (nb shared kernel)"
-5. Agent: `nb exec run "X = 42"` — set a variable
-6. Human: run `print(X)` in VS Code — verify shared state
-7. `nb sys shutdown` — clean up
-
-The human needs to be present to verify the VS Code side. Check `.nb/proxy.log` if the proxy fails silently.
+If something's wedged: `nb cleanup`.
 
 ---
 
 ## Agent Coding Guidelines
 
-- Avoid redundant info in docstrings, keep them short and to the point, prefer inline comments close to usage to reduce risk of inconsistency after human edits
-- Use typehints although not when it requires a load of stubbing things, ask if you are unsure, and you can use Any - be pragmatic
-- We use `uv` for everything so `uv run` and `uv add`
-- lint and test your code with `just lint`
-- we have a project journal in `./journal/` - journal entries should be readable in 1min and skimmable in 10s
+- Docstrings short and to the point; prefer inline comments close to usage.
+- Use typehints, but `Any` is fine when stubs are more trouble than they're worth.
+- We use `uv` for everything — `uv run` and `uv add`.
+- Lint and test with `just lint`.
+- Project journal lives in `./journal/` — entries should be readable in 1 min, skimmable in 10 s.

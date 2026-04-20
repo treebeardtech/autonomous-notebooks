@@ -1,17 +1,18 @@
 [project]
 name = "autonomous-notebooks"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Stdio MCP server for agents to read, edit, and execute Jupyter notebooks headlessly"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "ipykernel>=7.2.0",
     "jupyter-client>=8.8.0",
+    "mcp[cli]>=1.2.0",
     "nbformat>=5.10.4",
 ]
 
 [project.scripts]
-nb = "autonomous_notebooks.cli2:main"
+nb = "autonomous_notebooks.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -25,24 +26,6 @@ dev = [
     "pytest>=9.0.2",
     "ruff>=0.15.0",
 ]
-ai = [
-    "accelerate>=1.12.0",
-    "torch>=2.10.0",
-    "transformers>=5.2.0",
-]
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pypi"
-url = "https://pypi.org/simple"
-default = true
-
-[tool.uv.sources]
-torch = { index = "pytorch" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/autonomous_notebooks"]

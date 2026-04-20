@@ -1,18 +1,20 @@
 # autonomous-notebooks
 
-> **Pre-release** — this project is under active development. APIs may change without notice.
+> **Pre-release** — APIs may change without notice.
 
-CLI for agents to read, modify, and execute Jupyter notebooks headless — no Jupyter server, no browser, no VS Code required. Produces standard `.ipynb` files that open natively in VS Code.
-
-There is an experimental **sandboxed execution** mode for autonomous agents, currently supporting `podman-hpc`. Support for other container runtimes is planned.
+A stdio MCP server that lets agents read, edit, and execute Jupyter notebooks headlessly. No Jupyter server, no browser, no VS Code required. Produces standard `.ipynb` files that open natively in VS Code.
 
 ## Why
 
-Agents are very effective at research, analysis, and prototyping — but their interface with notebooks is challenging and suboptimal in VS Code. With the right integration and sandboxing, it should be possible to delegate research tasks to agents.
+Agents are effective at research, analysis, and prototyping — but their interface with notebooks has been awkward. This package exposes notebook operations as MCP tools so Claude Code (or any MCP client) can drive notebooks without shell-escaping multi-line source, without managing kernel lifecycles, and without a persistent daemon.
 
-## Getting started
+## How it works
 
-### Install
+- **Read/edit** are kernel-free — pure `nbformat` operations against the given `.ipynb` path.
+- **Exec** auto-starts an in-process `ipykernel` subprocess the first time you execute in a notebook. The kernel is keyed by the notebook's absolute path — one kernel per notebook, many notebooks concurrently.
+- Kernels **live for the lifetime of the MCP server**, which Claude Code owns. When Claude Code exits, every kernel dies with it.
+
+## Install and register
 
 Add to your project as a dev dependency:
 
@@ -20,155 +22,73 @@ Add to your project as a dev dependency:
 uv add --dev git+ssh://git@github.com/treebeardtech/autonomous-notebooks
 ```
 
-### Create and run a notebook
+Then tell Claude Code about the server. Either add to your project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "nb": { "command": "uv", "args": ["run", "nb", "mcp"] }
+  }
+}
+```
+
+…or register globally:
 
 ```bash
-nb open analysis.ipynb                      # creates notebook, starts kernel
-nb insert 0 "import math\nprint(math.pi)"  # add a cell (\n for newlines)
-nb exec 0                                   # execute it, outputs saved to .ipynb
+claude mcp add nb -- uv run nb mcp
 ```
 
-The kernel uses your current Python — no kernelspec registration needed. For multiline code, pipe via stdin:
+Open a Claude Code session in the project and the `nb` tools appear in the MCP tool list.
+
+## Hello, notebook
+
+Ask Claude:
+
+> Use the `nb` MCP server to create `hello.ipynb` and run a cell that prints the first ten Fibonacci numbers.
+
+Then open `hello.ipynb` in VS Code. The cell is already run, outputs already captured.
+
+## Tools
+
+All tools take `notebook_path` (absolute or relative, created if missing).
+
+| Tool | Purpose |
+| --- | --- |
+| `list_cells` | Compact one-line-per-cell summary. |
+| `read_cell(index?, cell_id?)` | Full source + outputs for one cell. |
+| `insert_cell(index, source, markdown=False)` | Insert at index; shifts existing cells down. |
+| `set_cell(source, index?, cell_id?, markdown=False)` | Overwrite a cell's source. |
+| `delete_cell(index?, cell_id?)` | Delete a cell. |
+| `clear_outputs(index?)` | Clear outputs from one cell or all code cells. |
+| `exec_cell(index?, cell_id?)` | Execute a cell; outputs written back to the file. |
+| `exec_range(start, end)` | Execute cells `[start, end)`; stops on first error. |
+| `exec_all` | Execute every code cell in order; stops on first error. |
+| `run_scratch(code)` | Execute arbitrary code without writing it to the notebook. |
+| `insert_and_exec(index, source)` | Insert a code cell and execute it in one step. |
+| `interrupt` | Send SIGINT to the notebook's kernel. |
+| `shutdown_kernel` | Stop the notebook's kernel. Next exec starts a fresh one. |
+
+## Admin CLI
+
+Only two subcommands. Everything else is MCP tools.
 
 ```bash
-cat <<'EOF' | nb insert 1 -- -
-for i in range(5):
-    result = i ** 2
-    print(f"{i}^2 = {result}")
-EOF
-nb exec 1
+nb mcp       # run the stdio MCP server (Claude Code invokes this)
+nb cleanup   # kill stray ipykernel processes and remove leftover .nb/
 ```
-
-Add markdown cells with `--md`:
-
-```bash
-nb insert 0 "# My Analysis" --md
-```
-
-### Work with cells
-
-```bash
-nb cells              # list all cells (compact)
-nb cell 2             # read one cell with full source + outputs
-nb cell --id abc123   # read cell by stable ID
-nb edit 2 "new code"  # overwrite cell source
-nb rm 3               # delete a cell
-nb run "2 + 2"        # scratch execution (not saved to notebook)
-```
-
-### Collaborate with VS Code
-
-Share the kernel so both you and the agent see the same variables:
-
-```bash
-nb serve              # installs proxy kernelspec
-```
-
-In VS Code: select kernel **"Python (nb: your-project-name)"** from the kernel picker. You may need to **Ctrl+Shift+P > Reload Window** first.
-
-Now both sides share state — the agent runs `nb run "X = 42"`, you run `print(X)` in VS Code and get `42`.
-
-```bash
-nb unserve            # remove kernelspec (kernel keeps running)
-```
-
-### Clean up
-
-```bash
-nb shutdown           # stops kernel, removes proxy kernelspec, clears state
-```
-
-## How it works
-
-```
-Agent  -->  nb CLI  -->  ipykernel (subprocess)
-                    -->  nbformat (.ipynb on disk)
-
-Human  -->  VS Code  -->  proxy.py (ZMQ bridge, launched via kernelspec)
-                          both connect to the same kernel
-```
-
-- ipykernel is launched directly as a subprocess (no Jupyter server)
-- `nbformat` reads/writes standard `.ipynb` files
-- Outputs are captured from the kernel and saved into cells
-- The proxy re-signs HMAC between VS Code's key and the kernel's key
-- Open the `.ipynb` in VS Code at any time to see results
-- State lives in `.nb/` in the working directory
-
-## Reference
-
-```bash
-nb open <path>              # start kernel, set active notebook (creates if missing)
-nb open <path> --kernel-name R  # use a specific kernelspec
-nb open <path> --sandboxed  # run kernel in container (requires podman-hpc)
-nb cells                    # list all cells
-nb cell <index|--id ID>     # read one cell with outputs
-nb insert <i> <source>      # insert cell (--md for markdown, - for stdin)
-nb edit <i|--id ID> <source>  # overwrite cell source (--md, -)
-nb exec <i|--id ID>         # execute cell, capture output
-nb run <code>               # execute scratch code (- for stdin)
-nb rm <i|--id ID>           # delete a cell
-nb save                     # save notebook to disk
-nb status                   # show kernel status, active notebook
-nb serve                    # share kernel with VS Code
-nb unserve                  # stop sharing (kernel keeps running)
-nb shutdown                 # stop kernel, clean up
-```
-
-## Troubleshooting
-
-**VS Code doesn't show the kernel** — Run **Ctrl+Shift+P > Reload Window** after `nb serve`.
-
-**VS Code "Restart Kernel" doesn't clear state** — By design. VS Code restarts the *proxy*, not the kernel. To truly restart, run `nb open <path>` then "Restart Kernel" in VS Code.
-
-**Proxy crashes silently** — Check `.nb/proxy.log`.
-
-**Kernel not responding** — Run `nb status`. If stopped, `nb open <path>` starts a fresh one.
 
 ## Contributing
-
-### Setup
-
-Clone the repo and install dependencies:
 
 ```bash
 git clone https://github.com/treebeardtech/autonomous-notebooks
 cd autonomous-notebooks
 just sync
+just lint   # ruff + pyright + pytest
 ```
 
-Lint, typecheck, and run tests:
-
-```bash
-just lint
-```
-
-### Local testing in another repo
-
-To test your local changes in another project, add `autonomous-notebooks` as an editable dependency:
+To test local changes in another project:
 
 ```bash
 cd /path/to/your-project
 uv add --dev --editable /path/to/autonomous-notebooks
-```
-
-Now `uv run nb` in your project uses your local CLI code and picks up changes immediately.
-
-### Debug podman-hpc
-
-```sh
-podman-hpc run \
-  --rm \
-  -it \
-  --network=none \
-  --gpu \
-  -e LD_LIBRARY_PATH=/usr/lib64 \
-  -v "$IPC_DIR:/ipc" \
-  -v "$HOME:$HOME:rw" \
-  -v "$NOTEBOOK_DIR:$NOTEBOOK_DIR:rw" \
-  -w "$NOTEBOOK_DIR" \
-  -e HOME="$HOME" \
-  --name nb-kernel-nbs \
-  docker.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 \
-  bash
 ```
