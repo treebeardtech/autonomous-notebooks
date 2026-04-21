@@ -1,14 +1,15 @@
 """Stdio MCP server exposing notebook tools.
 
 Read/edit tools are kernel-free — they operate on `.ipynb` files directly.
-Exec tools auto-start a kernel per notebook_path; kernels live in-process
-and die with the server when Claude Code exits.
+Exec tools fire background jobs that run on per-notebook threads. Kernels
+live in-process and die with the server when Claude Code exits.
 """
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
-from autonomous_notebooks import kernels, nb_io
-from autonomous_notebooks.exec_runner import exec_cell_to_disk, execute_code
+from autonomous_notebooks import jobs, kernels, nb_io
+from autonomous_notebooks.exec_runner import execute_code
 
 mcp = FastMCP("autonomous-notebooks")
 
@@ -105,7 +106,7 @@ def clear_outputs(notebook_path: str, index: int | None = None) -> str:
 
 
 @mcp.tool()
-def exec_cell(
+async def exec_cell(
     notebook_path: str,
     index: int | None = None,
     cell_id: str | None = None,
@@ -115,14 +116,17 @@ def exec_cell(
     nb_io.ensure_notebook(notebook_path)
     nb = nb_io.read_nb(notebook_path)
     idx = nb_io.resolve_index(nb, index=index, cell_id=cell_id)
-    client = kernels.get_or_start(notebook_path)
-    exec_cell_to_disk(client, notebook_path, idx, timeout=timeout)
-    nb = nb_io.read_nb(notebook_path)
-    return nb_io.fmt_cell_full(idx, nb.cells[idx])
+    if nb.cells[idx]["cell_type"] != "code":
+        return f"cell {idx} is {nb.cells[idx]['cell_type']}, not code"
+    try:
+        job = jobs.submit_execution(notebook_path, [idx], timeout=timeout)
+    except RuntimeError as exc:
+        return str(exc)
+    return f"executing cell {idx} (job {job.job_id})\n{notebook_path}"
 
 
 @mcp.tool()
-def exec_range(
+async def exec_range(
     notebook_path: str,
     start: int,
     end: int,
@@ -136,46 +140,49 @@ def exec_range(
     end = min(end, n)
     if start >= end:
         return f"empty range {start}:{end} (notebook has {n} cells)"
-    client = kernels.get_or_start(notebook_path)
-    executed: list[int] = []
-    for idx in range(start, end):
-        nb = nb_io.read_nb(notebook_path)
-        if nb.cells[idx]["cell_type"] != "code":
-            continue
-        result = exec_cell_to_disk(client, notebook_path, idx, timeout=timeout)
-        executed.append(idx)
-        if result["had_error"]:
-            return f"executed {executed}; stopped with error in cell {idx}"
-    return f"executed cells {executed}"
+
+    code_indices = [i for i in range(start, end) if nb.cells[i]["cell_type"] == "code"]
+    if not code_indices:
+        return f"no code cells in range {start}:{end}"
+
+    try:
+        job = jobs.submit_execution(notebook_path, code_indices, timeout=timeout)
+    except RuntimeError as exc:
+        return str(exc)
+    return f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}"
 
 
 @mcp.tool()
-def exec_all(notebook_path: str, timeout: int = 120) -> str:
+async def exec_all(notebook_path: str, timeout: int = 120) -> str:
     """Execute every code cell in order. Stops on first error."""
     nb_io.ensure_notebook(notebook_path)
     nb = nb_io.read_nb(notebook_path)
     code_indices = [i for i, c in enumerate(nb.cells) if c["cell_type"] == "code"]
     if not code_indices:
         return "no code cells to execute"
-    client = kernels.get_or_start(notebook_path)
-    for idx in code_indices:
-        result = exec_cell_to_disk(client, notebook_path, idx, timeout=timeout)
-        if result["had_error"]:
-            return f"stopped with error in cell {idx}"
-    return f"executed {len(code_indices)} cells"
+
+    try:
+        job = jobs.submit_execution(notebook_path, code_indices, timeout=timeout)
+    except RuntimeError as exc:
+        return str(exc)
+    return f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}"
 
 
 @mcp.tool()
-def run_scratch(notebook_path: str, code: str, timeout: int = 120) -> str:
+async def run_scratch(notebook_path: str, code: str, timeout: int = 120) -> str:
     """Execute `code` on the notebook's kernel without writing it back to the file."""
     nb_io.ensure_notebook(notebook_path)
-    client = kernels.get_or_start(notebook_path)
-    outputs = execute_code(client, code, timeout=timeout)
-    return nb_io.fmt_outputs(outputs, indent="") or "(no output)"
+
+    def _run() -> str:
+        client = kernels.get_or_start(notebook_path)
+        outputs = execute_code(client, code, timeout=timeout)
+        return nb_io.fmt_outputs(outputs, indent="") or "(no output)"
+
+    return await anyio.to_thread.run_sync(_run)
 
 
 @mcp.tool()
-def insert_and_exec(
+async def insert_and_exec(
     notebook_path: str,
     index: int,
     source: str,
@@ -186,10 +193,19 @@ def insert_and_exec(
     nb = nb_io.read_nb(notebook_path)
     idx = nb_io.insert_cell(nb, index, source, markdown=False)
     nb_io.atomic_write_nb(nb, notebook_path)
-    client = kernels.get_or_start(notebook_path)
-    exec_cell_to_disk(client, notebook_path, idx, timeout=timeout)
-    nb = nb_io.read_nb(notebook_path)
-    return nb_io.fmt_cell_full(idx, nb.cells[idx])
+
+    try:
+        job = jobs.submit_execution(notebook_path, [idx], timeout=timeout)
+    except RuntimeError as exc:
+        return f"cell inserted at {idx} but execution failed: {exc}"
+    return f"inserted and executing cell {idx} (job {job.job_id})\n{notebook_path}"
+
+
+@mcp.tool()
+async def exec_status(notebook_path: str) -> str:
+    """Check execution progress for a notebook. Shows active or most recent job."""
+    nb_io.ensure_notebook(notebook_path)
+    return jobs.get_status(notebook_path)
 
 
 # -- kernel lifecycle --

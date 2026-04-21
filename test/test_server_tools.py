@@ -1,10 +1,12 @@
 """Smoke tests for the MCP tool functions. Call them directly as Python."""
 
+import asyncio
+import time
 from pathlib import Path
 
 import pytest
 
-from autonomous_notebooks import kernels, server
+from autonomous_notebooks import jobs, kernels, server
 
 
 @pytest.fixture(autouse=True)
@@ -13,8 +15,36 @@ def cleanup_kernels():
     kernels.shutdown_all()
 
 
+@pytest.fixture(autouse=True)
+def cleanup_jobs():
+    yield
+    with jobs._lock:
+        jobs._active.clear()
+        jobs._finished.clear()
+
+
 def _nb(tmp_path: Path, name: str = "nb.ipynb") -> str:
     return str(tmp_path / name)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _run_and_wait(coro, notebook_path: str, timeout: float = 30):
+    """Run an async exec tool, then wait for the background job to finish."""
+    result = asyncio.run(coro)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = jobs.get_active_job(notebook_path)
+        if job is None:
+            break
+        if job.thread is not None:
+            job.thread.join(timeout=0.5)
+    return result
+
+
+# -- read/edit (sync, unchanged) --
 
 
 def test_list_cells_on_fresh_file_creates_notebook(tmp_path: Path):
@@ -39,42 +69,45 @@ def test_set_and_delete(tmp_path: Path):
     assert "(no cells)" in server.list_cells(p)
 
 
+# -- exec (async, fire-and-forget) --
+
+
 def test_insert_and_exec_captures_output(tmp_path: Path):
     p = _nb(tmp_path)
-    out = server.insert_and_exec(p, 0, "print('hello')")
-    assert "hello" in out
+    result = _run_and_wait(server.insert_and_exec(p, 0, "print('hello')"), p)
+    assert "executing" in result or "job" in result
+    assert "hello" in server.read_cell(p, index=0)
 
 
 def test_exec_all(tmp_path: Path):
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "x = 2")
     server.insert_cell(p, 1, "print(x * 3)")
-    server.exec_all(p)
+    _run_and_wait(server.exec_all(p), p)
     assert "6" in server.read_cell(p, index=1)
 
 
 def test_run_scratch_does_not_modify_notebook(tmp_path: Path):
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "a = 1")
-    server.exec_cell(p, index=0)
-    out = server.run_scratch(p, "a + 41")
+    _run_and_wait(server.exec_cell(p, index=0), p)
+    out = _run(server.run_scratch(p, "a + 41"))
     assert "42" in out
-    # scratch didn't add a cell
     assert "2 cells" not in server.list_cells(p)
 
 
 def test_two_notebooks_concurrent(tmp_path: Path):
     p1 = _nb(tmp_path, "a.ipynb")
     p2 = _nb(tmp_path, "b.ipynb")
-    server.insert_and_exec(p1, 0, "X = 'a'")
-    server.insert_and_exec(p2, 0, "X = 'b'")
-    assert "a" in server.run_scratch(p1, "X")
-    assert "b" in server.run_scratch(p2, "X")
+    _run_and_wait(server.insert_and_exec(p1, 0, "X = 'a'"), p1)
+    _run_and_wait(server.insert_and_exec(p2, 0, "X = 'b'"), p2)
+    assert "a" in _run(server.run_scratch(p1, "X"))
+    assert "b" in _run(server.run_scratch(p2, "X"))
 
 
 def test_clear_outputs_single(tmp_path: Path):
     p = _nb(tmp_path)
-    server.insert_and_exec(p, 0, "print('hi')")
+    _run_and_wait(server.insert_and_exec(p, 0, "print('hi')"), p)
     assert "-> hi" in server.read_cell(p, index=0)
     server.clear_outputs(p, index=0)
     assert "-> hi" not in server.read_cell(p, index=0)
@@ -82,10 +115,9 @@ def test_clear_outputs_single(tmp_path: Path):
 
 def test_shutdown_kernel_then_restart(tmp_path: Path):
     p = _nb(tmp_path)
-    server.insert_and_exec(p, 0, "X = 1")
+    _run_and_wait(server.insert_and_exec(p, 0, "X = 1"), p)
     server.shutdown_kernel(p)
-    # fresh kernel — X should not exist
-    out = server.run_scratch(p, "'X' in dir()")
+    out = _run(server.run_scratch(p, "'X' in dir()"))
     assert "False" in out
 
 
@@ -94,13 +126,38 @@ def test_exec_all_stops_on_error(tmp_path: Path):
     server.insert_cell(p, 0, "x = 1")
     server.insert_cell(p, 1, "raise RuntimeError('boom')")
     server.insert_cell(p, 2, "print('should not run')")
-    result = server.exec_all(p)
-    assert "stopped" in result
-    # cell 2 never ran, so no stream output line for it
-    assert "-> should not run" not in server.read_cell(p, index=2)
+    _run_and_wait(server.exec_all(p), p)
+    cell2 = server.read_cell(p, index=2)
+    # cell 2 was skipped — no "-> should not run" stream output, has Skipped marker
+    assert "-> should not run" not in cell2
+    assert "Skipped" in cell2
 
 
 def test_interrupt_with_no_kernel(tmp_path: Path):
     p = _nb(tmp_path)
     out = server.interrupt(p)
     assert "no kernel" in out
+
+
+def test_exec_status(tmp_path: Path):
+    p = _nb(tmp_path)
+    out = _run(server.exec_status(p))
+    assert "no execution history" in out
+
+
+def test_exec_conflict(tmp_path: Path):
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "import time; time.sleep(2)")
+    server.insert_cell(p, 1, "print('done')")
+    _run(server.exec_all(p))
+    # second exec on same notebook should report conflict
+    result = _run(server.exec_cell(p, index=0))
+    assert "already has a running job" in result
+    # wait for the first job to finish
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        job = jobs.get_active_job(p)
+        if job is None:
+            break
+        if job.thread is not None:
+            job.thread.join(timeout=0.5)

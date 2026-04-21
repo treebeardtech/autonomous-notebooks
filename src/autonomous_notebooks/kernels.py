@@ -8,11 +8,13 @@ import atexit
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from jupyter_client import KernelManager
 from jupyter_client.blocking import BlockingKernelClient
 
+_lock = threading.Lock()
 _kernels: dict[str, tuple[KernelManager, BlockingKernelClient]] = {}
 _shutdown_registered = False
 
@@ -25,30 +27,43 @@ def get_or_start(path: str) -> BlockingKernelClient:
     """Return the client for `path`'s kernel, starting one if needed."""
     _ensure_shutdown_hooks()
     k = _key(path)
-    existing = _kernels.get(k)
-    if existing is not None:
-        km, client = existing
-        if km.is_alive():
-            return client
-        # dead entry — drop and restart
-        _kernels.pop(k, None)
+
+    with _lock:
+        existing = _kernels.get(k)
+        if existing is not None:
+            km, client = existing
+            if km.is_alive():
+                return client
+            _kernels.pop(k, None)
 
     km = KernelManager()
     km.start_kernel()
     client = km.client()
     client.start_channels()
     client.wait_for_ready(timeout=30)
-    _kernels[k] = (km, client)
+
+    with _lock:
+        race = _kernels.get(k)
+        if race is not None and race[0].is_alive():
+            try:
+                client.stop_channels()
+                km.shutdown_kernel(now=True)
+            except Exception:
+                pass
+            return race[1]
+        _kernels[k] = (km, client)
     return client
 
 
 def is_running(path: str) -> bool:
-    entry = _kernels.get(_key(path))
-    return entry is not None and entry[0].is_alive()
+    with _lock:
+        entry = _kernels.get(_key(path))
+        return entry is not None and entry[0].is_alive()
 
 
 def interrupt(path: str) -> None:
-    entry = _kernels.get(_key(path))
+    with _lock:
+        entry = _kernels.get(_key(path))
     if entry is None:
         raise ValueError(f"no kernel for {path}")
     km, _ = entry
@@ -57,7 +72,8 @@ def interrupt(path: str) -> None:
 
 def shutdown(path: str) -> bool:
     """Stop the kernel for `path`. Returns True if one was running."""
-    entry = _kernels.pop(_key(path), None)
+    with _lock:
+        entry = _kernels.pop(_key(path), None)
     if entry is None:
         return False
     km, client = entry
@@ -74,7 +90,8 @@ def shutdown(path: str) -> bool:
 
 def shutdown_all() -> int:
     """Stop every kernel. Returns number stopped."""
-    paths = list(_kernels.keys())
+    with _lock:
+        paths = list(_kernels.keys())
     n = 0
     for p in paths:
         if shutdown(p):
@@ -99,12 +116,10 @@ def _ensure_shutdown_hooks() -> None:
 
     def _handler(signum, _frame):
         shutdown_all()
-        # re-raise default behavior after cleanup
         sys.exit(128 + signum)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             signal.signal(sig, _handler)
         except ValueError:
-            # not in main thread — skip
             pass

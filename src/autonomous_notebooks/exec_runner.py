@@ -12,6 +12,25 @@ from autonomous_notebooks.nb_io import (
 )
 
 
+def write_cell_status(nb_path: str, idx: int, status: str) -> None:
+    """Write a status marker as the cell's sole output on disk."""
+    nb = read_nb(nb_path)
+    cell = nb.cells[idx]
+    cell["outputs"] = [nbformat.v4.new_output("stream", name="stdout", text=status)]
+    cell["execution_count"] = None
+    atomic_write_nb(nb, nb_path)
+
+
+def mark_cells_status(nb_path: str, indices: list[int], status: str) -> None:
+    """Write a status marker to multiple cells' outputs in a single disk write."""
+    nb = read_nb(nb_path)
+    for idx in indices:
+        cell = nb.cells[idx]
+        cell["outputs"] = [nbformat.v4.new_output("stream", name="stdout", text=status)]
+        cell["execution_count"] = None
+    atomic_write_nb(nb, nb_path)
+
+
 def execute_code(
     client: BlockingKernelClient,
     code: str,
