@@ -1,5 +1,7 @@
 """Execute code on a kernel. Capture outputs. Stream to disk for cell execs."""
 
+import queue
+import time
 import uuid
 from collections.abc import Callable
 
@@ -40,27 +42,50 @@ def execute_code(
     code: str,
     timeout: int = 120,
     on_output: Callable[[list], None] | None = None,
+    interrupt_fn: Callable[[], None] | None = None,
 ) -> list:
     """Execute `code` on `client`, return list of nbformat output dicts.
+
+    `timeout` is a **wall-clock deadline** for the whole execution, not the gap
+    between messages — a cell that streams output continuously still gets
+    killed on schedule. When the deadline fires, `interrupt_fn` is called (if
+    given) to tell the kernel to stop, and a timeout marker is appended.
 
     If `on_output` is provided, it's called after each new output with the
     full outputs list so far.
     """
     msg_id = client.execute(code)
     outputs: list = []
+    deadline = time.monotonic() + timeout
+    # Poll at least once per second so we notice the deadline even while the
+    # cell is chatty (each get_iopub_msg returns quickly when messages stream).
+    poll = 1.0
 
     while True:
-        try:
-            msg = client.get_iopub_msg(timeout=timeout)
-        except TimeoutError:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("cell execution exceeded %ds — interrupting kernel", timeout)
+            if interrupt_fn is not None:
+                try:
+                    interrupt_fn()
+                except Exception:
+                    log.exception("interrupt_fn raised during timeout handling")
             outputs.append(
                 nbformat.v4.new_output(
-                    "stream", name="stderr", text="[nb mcp] [execution timed out]"
+                    "stream",
+                    name="stderr",
+                    text=f"[nb mcp] [execution timed out after {timeout}s — kernel interrupted]",
                 )
             )
             if on_output:
                 on_output(outputs)
             break
+
+        try:
+            msg = client.get_iopub_msg(timeout=min(remaining, poll))
+        except (TimeoutError, queue.Empty):
+            # No message within the poll window — loop to check deadline.
+            continue
 
         if msg["parent_header"].get("msg_id") != msg_id:
             continue
@@ -150,6 +175,7 @@ def exec_cell_to_disk(
     timeout: int = 120,
     on_output: Callable[[list], None] | None = None,
     running_header: str | None = None,
+    interrupt_fn: Callable[[], None] | None = None,
 ) -> dict:
     """Run cell at idx, streaming outputs into the file. Returns summary dict.
 
@@ -187,7 +213,13 @@ def exec_cell_to_disk(
         if on_output is not None:
             on_output(outputs)
 
-    outputs = execute_code(client, source, timeout=timeout, on_output=_on_output)
+    outputs = execute_code(
+        client,
+        source,
+        timeout=timeout,
+        on_output=_on_output,
+        interrupt_fn=interrupt_fn,
+    )
     _flush_outputs_to_disk(nb_path, cell_id, outputs, set_execution_count=True)
 
     had_error = any(o.get("output_type") == "error" for o in outputs)

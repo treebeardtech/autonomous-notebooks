@@ -177,7 +177,12 @@ async def run_scratch(notebook_path: str, code: str, timeout: int = 120) -> str:
 
     def _run() -> str:
         client = kernels.get_or_start(notebook_path)
-        outputs = execute_code(client, code, timeout=timeout)
+        outputs = execute_code(
+            client,
+            code,
+            timeout=timeout,
+            interrupt_fn=lambda: kernels.interrupt(notebook_path),
+        )
         return nb_io.fmt_outputs(outputs, indent="") or "(no output)"
 
     return await anyio.to_thread.run_sync(_run)

@@ -158,6 +158,9 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
             def _bump_idle(_outputs: list, cp=cp) -> None:
                 cp.last_output_at = time.monotonic()
 
+            def _interrupt(path=job.notebook_path) -> None:
+                kernels.interrupt(path)
+
             result = exec_cell_to_disk(
                 client,
                 job.notebook_path,
@@ -165,6 +168,7 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 timeout=timeout,
                 on_output=_bump_idle,
                 running_header=running_header,
+                interrupt_fn=_interrupt,
             )
 
             cp.finished_at = time.monotonic()

@@ -177,6 +177,24 @@ def test_wait_on_fresh_notebook(tmp_path: Path):
     assert "no execution history" in out
 
 
+def test_timeout_is_wall_clock_not_idle_gap(tmp_path: Path):
+    """A cell that streams output every 0.1s must still timeout at wall-clock deadline."""
+    p = _nb(tmp_path)
+    # Print every 100ms for up to 10s. Timeout is 2s, so cell should be
+    # killed at ~2s even though messages arrive continuously.
+    server.insert_cell(
+        p,
+        0,
+        "import time\nfor i in range(100):\n    print(i, flush=True)\n    time.sleep(0.1)",
+    )
+    start = time.monotonic()
+    _run_and_wait(server.exec_cell(p, index=0, timeout=2), p, timeout=15)
+    elapsed = time.monotonic() - start
+    assert elapsed < 10, f"cell ran for {elapsed:.1f}s, should have been killed at ~2s"
+    body = server.read_cell(p, index=0)
+    assert "timed out after 2s" in body
+
+
 def test_exec_cell_without_id_streams_output(tmp_path: Path):
     """Notebooks written outside the MCP may lack cell ids — exec must still flush outputs."""
     import json
