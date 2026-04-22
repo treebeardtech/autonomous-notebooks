@@ -1,6 +1,7 @@
 """Background execution jobs. One active job per notebook, backed by a daemon thread."""
 
 import enum
+import os
 import threading
 import time
 import uuid
@@ -86,6 +87,30 @@ def _now_ts() -> str:
     return with_name or now.strftime("%H:%M:%S %z")
 
 
+def _progress_interval() -> float:
+    """Minimum seconds between progress log lines per cell. 0 disables progress logging."""
+    raw = os.environ.get("NB_MCP_PROGRESS_INTERVAL_SEC")
+    if raw is None:
+        return 1.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 1.0
+
+
+def _output_tail(outputs: list, max_len: int = 200) -> str | None:
+    """Last non-empty stream line across recent outputs, truncated. None if no text."""
+    for out in reversed(outputs):
+        if out.get("output_type") != "stream":
+            continue
+        text = out.get("text", "")
+        for line in reversed(text.rstrip("\n").split("\n")):
+            line = line.strip()
+            if line:
+                return line if len(line) <= max_len else line[: max_len - 3] + "..."
+    return None
+
+
 def _nb_key(path: str) -> str:
     from pathlib import Path
 
@@ -155,8 +180,31 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 "job %s cell [%d] running (%d/%d)", job.job_id, idx, pos + 1, total
             )
 
-            def _bump_idle(_outputs: list, cp=cp) -> None:
+            progress = {"last_logged": 0.0, "last_count": 0}
+            interval = _progress_interval()
+
+            def _on_output(
+                outputs: list,
+                cp=cp,
+                idx=idx,
+                job_id=job.job_id,
+                st=progress,
+                interval=interval,
+            ) -> None:
                 cp.last_output_at = time.monotonic()
+                if interval <= 0:
+                    return
+                if len(outputs) == st["last_count"]:
+                    return
+                now = time.monotonic()
+                if now - st["last_logged"] < interval:
+                    return
+                tail = _output_tail(outputs)
+                if tail is None:
+                    return
+                st["last_logged"] = now
+                st["last_count"] = len(outputs)
+                log.info("job %s cell [%d] out: %s", job_id, idx, tail)
 
             def _interrupt(path=job.notebook_path) -> None:
                 kernels.interrupt(path)
@@ -169,7 +217,7 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 job.notebook_path,
                 idx,
                 timeout=timeout,
-                on_output=_bump_idle,
+                on_output=_on_output,
                 running_header=running_header,
                 interrupt_fn=_interrupt,
                 recover_fn=_recover,

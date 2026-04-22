@@ -206,6 +206,48 @@ def test_timeout_is_wall_clock_not_idle_gap(tmp_path: Path):
     assert "timed out after 2s" in body
 
 
+def test_progress_lines_written_to_log(tmp_path: Path, monkeypatch):
+    """Chatty cells should emit throttled progress log lines for Monitor consumption."""
+    import importlib
+    import logging
+
+    log_path = tmp_path / "nb_mcp.log"
+    monkeypatch.setenv("NB_MCP_LOG_PATH", str(log_path))
+    monkeypatch.setenv("NB_MCP_LOG_LEVEL", "INFO")
+    # Fast progress emission so the test runs quickly.
+    monkeypatch.setenv("NB_MCP_PROGRESS_INTERVAL_SEC", "0.2")
+
+    # Reset the shared logger so it picks up the env vars.
+    from autonomous_notebooks import _log
+
+    importlib.reload(_log)
+    logger = logging.getLogger("nb_mcp")
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    _log._configured = False
+    _log.get_logger()
+    # Re-attach the reinitialised handlers to the loggers held by jobs/exec_runner.
+    from autonomous_notebooks import exec_runner as _er
+    from autonomous_notebooks import jobs as _jb
+
+    _er.log = logger
+    _jb.log = logger
+
+    p = _nb(tmp_path, "progress.ipynb")
+    server.insert_cell(
+        p,
+        0,
+        "import time\nfor i in range(20):\n    print(f'step {i}', flush=True)\n    time.sleep(0.1)",
+    )
+    _run_and_wait(server.exec_cell(p, index=0, timeout=30, block_for=0), p)
+
+    body = log_path.read_text()
+    progress_lines = [line for line in body.splitlines() if " out: step " in line]
+    assert len(progress_lines) >= 2, body
+    # Throttled: we shouldn't see every one of the 20 prints.
+    assert len(progress_lines) < 20, f"progress not throttled: {len(progress_lines)}"
+
+
 def test_exec_cell_without_id_streams_output(tmp_path: Path):
     """Notebooks written outside the MCP may lack cell ids — exec must still flush outputs."""
     import json
