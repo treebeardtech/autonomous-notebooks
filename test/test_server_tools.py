@@ -177,6 +177,26 @@ def test_wait_on_fresh_notebook(tmp_path: Path):
     assert "no execution history" in out
 
 
+def test_exec_cell_without_id_streams_output(tmp_path: Path):
+    """Notebooks written outside the MCP may lack cell ids — exec must still flush outputs."""
+    import json
+
+    import nbformat
+
+    p = _nb(tmp_path)
+    # Build an ipynb by hand with an id-less code cell.
+    nb = nbformat.v4.new_notebook()
+    cell = nbformat.v4.new_code_cell(source="print('hi from idless')")
+    cell.pop("id", None)
+    nb.cells.append(cell)
+    Path(p).write_text(json.dumps(nb))
+
+    _run_and_wait(server.exec_cell(p, index=0), p)
+    body = server.read_cell(p, index=0)
+    assert "hi from idless" in body
+    assert "[nb mcp] ✓ Done" in body
+
+
 def test_exec_conflict(tmp_path: Path):
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "import time; time.sleep(2)")

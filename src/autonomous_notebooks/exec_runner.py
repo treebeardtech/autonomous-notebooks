@@ -1,5 +1,6 @@
 """Execute code on a kernel. Capture outputs. Stream to disk for cell execs."""
 
+import uuid
 from collections.abc import Callable
 
 import nbformat
@@ -123,6 +124,15 @@ def _flush_outputs_to_disk(
         if hit:
             target = hit[1]
     if target is None:
+        # Should not happen: exec_cell_to_disk backfills ids before streaming.
+        # If it does, surface it loudly rather than silently dropping outputs.
+        import sys
+
+        print(
+            f"warning: nb mcp could not find cell (id={cell_id!r}) in {nb_path}; "
+            f"dropped {len(outputs)} outputs",
+            file=sys.stderr,
+        )
         return
     target["outputs"] = list(outputs)
     if set_execution_count:
@@ -154,7 +164,13 @@ def exec_cell_to_disk(
     cell = nb.cells[idx]
     if cell["cell_type"] != "code":
         raise ValueError(f"cell {idx} is {cell['cell_type']}, not code")
+    # Notebooks written outside the MCP may lack cell ids. Backfill one so
+    # streaming flushes (which address cells by id) don't silently no-op.
     cell_id = cell.get("id")
+    if not cell_id:
+        cell_id = uuid.uuid4().hex[:8]
+        cell["id"] = cell_id
+        atomic_write_nb(nb, nb_path)
     source = cell["source"]
 
     # Surface the running banner before the kernel emits anything, so there's no
