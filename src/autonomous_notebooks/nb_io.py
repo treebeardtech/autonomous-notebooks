@@ -87,6 +87,39 @@ def fmt_outputs(outputs: list, indent: str = "  ") -> str:
     return "\n".join(parts)
 
 
+def fmt_output_oneliner(outputs: list, max_len: int = 120) -> str:
+    """First-line summary of cell outputs for progress reporting."""
+    if not outputs:
+        return "(no output)"
+    parts = []
+    for out in outputs:
+        otype = out.get("output_type", "")
+        if otype == "stream":
+            first = out["text"].strip().split("\n", 1)[0]
+            if first:
+                parts.append(f"-> {first}")
+        elif otype == "execute_result":
+            text = out.get("data", {}).get("text/plain", "").strip().split("\n", 1)[0]
+            if text:
+                parts.append(f"=> {text}")
+        elif otype == "display_data":
+            text = out.get("data", {}).get("text/plain", "")
+            if text:
+                first = text.strip().split("\n", 1)[0]
+                parts.append(f":: {first}")
+            else:
+                mimes = list(out.get("data", {}).keys())
+                parts.append(f":: <{', '.join(mimes)}>")
+        elif otype == "error":
+            parts.append(f"!! {out['ename']}: {out['evalue']}")
+    if not parts:
+        return "(no output)"
+    line = " | ".join(parts)
+    if len(line) > max_len:
+        line = line[: max_len - 3] + "..."
+    return line
+
+
 def fmt_cell_compact(i: int, cell: dict) -> str:
     ctype = cell["cell_type"]
     src = cell["source"]

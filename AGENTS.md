@@ -46,11 +46,20 @@ All tools take `notebook_path: str` as their first argument.
 - `clear_outputs(notebook_path, index?)`
 
 **Exec (auto-starts kernel)**
-- `exec_cell(notebook_path, index?, cell_id?, timeout=120)`
-- `exec_range(notebook_path, start, end, timeout=120)`
-- `exec_all(notebook_path, timeout=120)`
+- `exec_cell(notebook_path, index?, cell_id?, timeout=120, block_for=10)`
+- `exec_range(notebook_path, start, end, timeout=120, block_for=10)`
+- `exec_all(notebook_path, timeout=120, block_for=10)`
 - `run_scratch(notebook_path, code, timeout=120)` — ephemeral
-- `insert_and_exec(notebook_path, index, source, timeout=120)`
+- `insert_and_exec(notebook_path, index, source, timeout=120, block_for=10)`
+- `exec_status(notebook_path)` — snapshot of the active or most recent job
+- `status()` — **global** snapshot: every kernel + every active/recent job (no path arg)
+
+The non-scratch exec tools block for up to `block_for` seconds (default
+10). If the job finishes in time, the response is the full status inline.
+Otherwise the response is a ready-to-use Monitor command, e.g.
+`Monitor(command='uv run nb watch --job abc123 --path nb.ipynb')`. The
+agent pairs that with Claude Code's Monitor tool to stream progress
+without blocking the conversation. Set `block_for=0` for fire-and-forget.
 
 **Kernel lifecycle**
 - `interrupt(notebook_path)`
@@ -65,9 +74,34 @@ The server also auto-creates empty `.ipynb` files on first touch, so `insert_cel
 Minimal. Primary interface is MCP.
 
 ```
-nb mcp       # run the stdio MCP server
-nb cleanup   # kill stray ipykernel processes and delete .nb/
+nb mcp                              # run the stdio MCP server
+nb cleanup                          # kill stray ipykernel processes and delete .nb/
+nb status                           # summarise recent jobs from the log + live
+                                    # ipykernel processes. For the running MCP's
+                                    # in-memory state, use the `status` MCP tool.
+nb watch --job <id> [--path <nb>]   # tail .nb_mcp.log for one job, exit when done.
+                                    # emit one line per event — designed for Monitor.
 ```
+
+## 4a. Logging
+
+Server writes to `./.nb_mcp.log` (CWD) at INFO level by default. Covers
+job/cell lifecycle, kernel start/stop, dropped-output warnings, and
+unhandled exceptions. Override via `NB_MCP_LOG_LEVEL`
+(DEBUG/INFO/WARNING/ERROR) or `NB_MCP_LOG_PATH`.
+
+While a cell is running, two kinds of progress line land in the log —
+both matching the `nb watch` → Monitor filter:
+
+- `job X cell [N] out: …` — the last line of fresh stream output,
+  throttled to one per `NB_MCP_PROGRESS_INTERVAL_SEC` (default 10s).
+- `job X cell [N] still running (Ns elapsed)` — heartbeat that fires
+  only if the cell has produced no output AND the progress emitter
+  hasn't logged within the interval. Keeps Monitor pinging the agent
+  during silent work (`time.sleep`, GPU compute, blocking I/O) so a
+  healthy-but-quiet cell doesn't look hung.
+
+Set `NB_MCP_PROGRESS_INTERVAL_SEC=0` to disable both.
 
 ---
 
