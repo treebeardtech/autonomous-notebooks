@@ -87,10 +87,10 @@ unhandled exceptions. Override via `NB_MCP_LOG_LEVEL`
 (DEBUG/INFO/WARNING/ERROR) or `NB_MCP_LOG_PATH`.
 
 While a cell is running, the last line of fresh stream output is
-also logged as `job X cell [N] out: …` — throttled to one line per
-second per cell so `nb watch` → Monitor produces a steady notification
-stream without a firehose. Tune or disable via
-`NB_MCP_PROGRESS_INTERVAL_SEC` (default 1.0, 0 disables).
+also logged as `job X cell [N] out: …` — throttled to one line every
+10 seconds per cell so `nb watch` → Monitor produces a steady
+notification stream without a firehose. Tune or disable via
+`NB_MCP_PROGRESS_INTERVAL_SEC` (default 10.0, 0 disables).
 
 ---
 

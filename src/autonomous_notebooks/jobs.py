@@ -91,11 +91,11 @@ def _progress_interval() -> float:
     """Minimum seconds between progress log lines per cell. 0 disables progress logging."""
     raw = os.environ.get("NB_MCP_PROGRESS_INTERVAL_SEC")
     if raw is None:
-        return 1.0
+        return 10.0
     try:
         return max(0.0, float(raw))
     except ValueError:
-        return 1.0
+        return 10.0
 
 
 def _output_tail(outputs: list, max_len: int = 200) -> str | None:
