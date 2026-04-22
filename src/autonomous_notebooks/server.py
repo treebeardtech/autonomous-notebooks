@@ -16,6 +16,15 @@ log = get_logger()
 mcp = FastMCP("autonomous-notebooks")
 
 
+def _monitor_hint(job_id: str, notebook_path: str) -> str:
+    """Ready-to-use Monitor command line so the agent can stream progress."""
+    return (
+        f"Tail progress with Claude Code's Monitor tool:\n"
+        f"  Monitor(command='uv run nb watch --job {job_id} "
+        f"--path {notebook_path}', description='nb job {job_id}')"
+    )
+
+
 # -- read --
 
 
@@ -124,7 +133,10 @@ async def exec_cell(
         job = jobs.submit_execution(notebook_path, [idx], timeout=timeout)
     except RuntimeError as exc:
         return str(exc)
-    return f"executing cell {idx} (job {job.job_id})\n{notebook_path}"
+    return (
+        f"executing cell {idx} (job {job.job_id})\n{notebook_path}\n\n"
+        f"{_monitor_hint(job.job_id, notebook_path)}"
+    )
 
 
 @mcp.tool()
@@ -151,7 +163,10 @@ async def exec_range(
         job = jobs.submit_execution(notebook_path, code_indices, timeout=timeout)
     except RuntimeError as exc:
         return str(exc)
-    return f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}"
+    return (
+        f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}\n\n"
+        f"{_monitor_hint(job.job_id, notebook_path)}"
+    )
 
 
 @mcp.tool()
@@ -167,7 +182,10 @@ async def exec_all(notebook_path: str, timeout: int = 120) -> str:
         job = jobs.submit_execution(notebook_path, code_indices, timeout=timeout)
     except RuntimeError as exc:
         return str(exc)
-    return f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}"
+    return (
+        f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}\n\n"
+        f"{_monitor_hint(job.job_id, notebook_path)}"
+    )
 
 
 @mcp.tool()
@@ -206,7 +224,10 @@ async def insert_and_exec(
         job = jobs.submit_execution(notebook_path, [idx], timeout=timeout)
     except RuntimeError as exc:
         return f"cell inserted at {idx} but execution failed: {exc}"
-    return f"inserted and executing cell {idx} (job {job.job_id})\n{notebook_path}"
+    return (
+        f"inserted and executing cell {idx} (job {job.job_id})\n{notebook_path}\n\n"
+        f"{_monitor_hint(job.job_id, notebook_path)}"
+    )
 
 
 @mcp.tool()
@@ -214,25 +235,6 @@ async def exec_status(notebook_path: str) -> str:
     """Check execution progress for a notebook. Shows active or most recent job."""
     nb_io.ensure_notebook(notebook_path)
     return jobs.get_status(notebook_path)
-
-
-@mcp.tool()
-async def wait(notebook_path: str, timeout: int = 30) -> str:
-    """Block until the active job finishes or `timeout` seconds elapse.
-
-    Use this instead of sleeping: returns as soon as the job is done, or on
-    timeout so you can inspect progress. The status includes per-cell elapsed
-    time and "last output Xs ago" for the running cell — if idle time keeps
-    climbing across calls, the cell may be hung; if it's low, things are
-    making progress and you can call `wait` again (with a longer timeout).
-    """
-    nb_io.ensure_notebook(notebook_path)
-
-    def _wait() -> str:
-        jobs.wait_for_job(notebook_path, timeout=timeout)
-        return jobs.get_status(notebook_path)
-
-    return await anyio.to_thread.run_sync(_wait)
 
 
 # -- kernel lifecycle --

@@ -285,11 +285,3 @@ def get_status(notebook_path: str) -> str:
         lines.append(f"  [{idx}] {cp.status.value}{elapsed_str}{idle_str}{err_str}")
 
     return "\n".join(lines)
-
-
-def wait_for_job(notebook_path: str, timeout: float) -> None:
-    """Block up to `timeout` seconds for the active job on this notebook to finish."""
-    job = get_active_job(notebook_path)
-    if job is None or job.thread is None:
-        return
-    job.thread.join(timeout=timeout)

@@ -52,7 +52,11 @@ All tools take `notebook_path: str` as their first argument.
 - `run_scratch(notebook_path, code, timeout=120)` — ephemeral
 - `insert_and_exec(notebook_path, index, source, timeout=120)`
 - `exec_status(notebook_path)` — snapshot of the active or most recent job
-- `wait(notebook_path, timeout=30)` — block until job finishes or timeout; status includes idle time so the agent can tell progress from hang
+
+Non-scratch exec tools return a Monitor-ready hint, e.g.
+`Monitor(command='uv run nb watch --job abc123 --path nb.ipynb')`. The
+agent pairs that with Claude Code's Monitor tool to stream progress
+without blocking the conversation.
 
 **Kernel lifecycle**
 - `interrupt(notebook_path)`
@@ -67,8 +71,10 @@ The server also auto-creates empty `.ipynb` files on first touch, so `insert_cel
 Minimal. Primary interface is MCP.
 
 ```
-nb mcp       # run the stdio MCP server
-nb cleanup   # kill stray ipykernel processes and delete .nb/
+nb mcp                              # run the stdio MCP server
+nb cleanup                          # kill stray ipykernel processes and delete .nb/
+nb watch --job <id> [--path <nb>]   # tail .nb_mcp.log for one job, exit when done.
+                                    # emit one line per event — designed for Monitor.
 ```
 
 ## 4a. Logging
