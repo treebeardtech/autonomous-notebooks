@@ -76,6 +76,13 @@ _active: dict[str, Job] = {}
 _finished: dict[str, Job] = {}
 
 
+def _now_ts() -> str:
+    """Local wall-clock with timezone — unambiguous across remote servers."""
+    now = datetime.now().astimezone()
+    with_name = now.strftime("%H:%M:%S %Z").rstrip()
+    return with_name or now.strftime("%H:%M:%S %z")
+
+
 def _nb_key(path: str) -> str:
     from pathlib import Path
 
@@ -106,7 +113,7 @@ def submit_execution(
         )
         _active[key] = job
 
-    mark_cells_status(notebook_path, cell_indices, "⏳ Queued")
+    mark_cells_status(notebook_path, cell_indices, f"[nb mcp] ⏳ Queued at {_now_ts()}")
 
     t = threading.Thread(
         target=_run_job,
@@ -130,11 +137,9 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
             cp.status = CellStatus.RUNNING
             cp.started_at = time.monotonic()
 
-            ts = datetime.now().strftime("%H:%M:%S")
-            write_cell_status(
-                job.notebook_path,
-                idx,
-                f"⏳ Running ({pos + 1}/{total})... (started {ts})",
+            started_ts = _now_ts()
+            running_header = (
+                f"[nb mcp] ▶ Running ({pos + 1}/{total}, started {started_ts})\n"
             )
 
             def _bump_idle(_outputs: list, cp=cp) -> None:
@@ -146,15 +151,21 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 idx,
                 timeout=timeout,
                 on_output=_bump_idle,
+                running_header=running_header,
             )
 
             cp.finished_at = time.monotonic()
             elapsed = cp.elapsed or 0.0
+            finished_ts = _now_ts()
 
             if result["had_error"]:
                 cp.status = CellStatus.ERROR
                 cp.error_summary = _extract_error(result["outputs"])
-                _append_status_line(job.notebook_path, idx, f"✗ {elapsed:.1f}s")
+                _append_status_line(
+                    job.notebook_path,
+                    idx,
+                    f"[nb mcp] ✗ Error at {finished_ts} · ran {elapsed:.1f}s",
+                )
 
                 for remaining_idx in job.cell_indices[pos + 1 :]:
                     rcp = job.cells[remaining_idx]
@@ -162,14 +173,18 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                     write_cell_status(
                         job.notebook_path,
                         remaining_idx,
-                        "⊘ Skipped (earlier cell errored)",
+                        "[nb mcp] ⊘ Skipped (earlier cell errored)",
                     )
 
                 job.state = JobState.ERROR
                 return
             else:
                 cp.status = CellStatus.DONE
-                _append_status_line(job.notebook_path, idx, f"✓ {elapsed:.1f}s")
+                _append_status_line(
+                    job.notebook_path,
+                    idx,
+                    f"[nb mcp] ✓ Done at {finished_ts} · ran {elapsed:.1f}s",
+                )
 
         job.state = JobState.DONE
 
@@ -194,11 +209,11 @@ def _extract_error(outputs: list) -> str:
 
 
 def _append_status_line(nb_path: str, idx: int, text: str) -> None:
-    """Append a timing/status line to a cell's existing outputs on disk."""
+    """Append an nb-mcp timing/status line to a cell's existing outputs on disk (stderr-styled)."""
     nb = read_nb(nb_path)
     cell = nb.cells[idx]
     cell["outputs"].append(
-        nbformat.v4.new_output("stream", name="stdout", text=f"\n{text}")
+        nbformat.v4.new_output("stream", name="stderr", text=f"\n{text}")
     )
     atomic_write_nb(nb, nb_path)
 

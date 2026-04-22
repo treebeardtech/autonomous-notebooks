@@ -13,20 +13,20 @@ from autonomous_notebooks.nb_io import (
 
 
 def write_cell_status(nb_path: str, idx: int, status: str) -> None:
-    """Write a status marker as the cell's sole output on disk."""
+    """Write an nb-mcp status marker as the cell's sole output on disk (stderr-styled)."""
     nb = read_nb(nb_path)
     cell = nb.cells[idx]
-    cell["outputs"] = [nbformat.v4.new_output("stream", name="stdout", text=status)]
+    cell["outputs"] = [nbformat.v4.new_output("stream", name="stderr", text=status)]
     cell["execution_count"] = None
     atomic_write_nb(nb, nb_path)
 
 
 def mark_cells_status(nb_path: str, indices: list[int], status: str) -> None:
-    """Write a status marker to multiple cells' outputs in a single disk write."""
+    """Write an nb-mcp status marker to multiple cells' outputs in a single disk write."""
     nb = read_nb(nb_path)
     for idx in indices:
         cell = nb.cells[idx]
-        cell["outputs"] = [nbformat.v4.new_output("stream", name="stdout", text=status)]
+        cell["outputs"] = [nbformat.v4.new_output("stream", name="stderr", text=status)]
         cell["execution_count"] = None
     atomic_write_nb(nb, nb_path)
 
@@ -51,7 +51,7 @@ def execute_code(
         except TimeoutError:
             outputs.append(
                 nbformat.v4.new_output(
-                    "stream", name="stderr", text="[execution timed out]"
+                    "stream", name="stderr", text="[nb mcp] [execution timed out]"
                 )
             )
             if on_output:
@@ -100,6 +100,14 @@ def execute_code(
     return outputs
 
 
+def _with_running_header(outputs: list, running_header: str | None) -> list:
+    """Return a disk-copy of outputs prefixed with an nb-mcp running banner (if any)."""
+    if not running_header:
+        return list(outputs)
+    header = nbformat.v4.new_output("stream", name="stderr", text=running_header)
+    return [header, *outputs]
+
+
 def _flush_outputs_to_disk(
     nb_path: str,
     cell_id: str | None,
@@ -131,11 +139,16 @@ def exec_cell_to_disk(
     idx: int,
     timeout: int = 120,
     on_output: Callable[[list], None] | None = None,
+    running_header: str | None = None,
 ) -> dict:
     """Run cell at idx, streaming outputs into the file. Returns summary dict.
 
     `on_output` is called (after the disk flush) on every new output, so callers
     can track activity timestamps for hang detection.
+
+    `running_header`, if given, is written as a stderr-stream banner at the top
+    of the cell's outputs for the duration of execution. The final flush removes
+    it — callers then append their own completion footer.
     """
     nb = read_nb(nb_path)
     cell = nb.cells[idx]
@@ -144,8 +157,17 @@ def exec_cell_to_disk(
     cell_id = cell.get("id")
     source = cell["source"]
 
+    # Surface the running banner before the kernel emits anything, so there's no
+    # silent gap between the Queued marker and the first cell output.
+    if running_header:
+        _flush_outputs_to_disk(
+            nb_path, cell_id, _with_running_header([], running_header)
+        )
+
     def _on_output(outputs: list) -> None:
-        _flush_outputs_to_disk(nb_path, cell_id, outputs)
+        _flush_outputs_to_disk(
+            nb_path, cell_id, _with_running_header(outputs, running_header)
+        )
         if on_output is not None:
             on_output(outputs)
 
