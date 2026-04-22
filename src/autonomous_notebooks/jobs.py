@@ -41,6 +41,7 @@ class CellProgress:
     status: CellStatus = CellStatus.QUEUED
     started_at: float | None = None
     finished_at: float | None = None
+    last_output_at: float | None = None
     error_summary: str | None = None
 
     @property
@@ -49,6 +50,13 @@ class CellProgress:
             return None
         end = self.finished_at or time.monotonic()
         return end - self.started_at
+
+    @property
+    def idle(self) -> float | None:
+        """Seconds since the last output, while running. None if finished or never produced output."""
+        if self.last_output_at is None or self.finished_at is not None:
+            return None
+        return time.monotonic() - self.last_output_at
 
 
 @dataclass
@@ -129,7 +137,16 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 f"⏳ Running ({pos + 1}/{total})... (started {ts})",
             )
 
-            result = exec_cell_to_disk(client, job.notebook_path, idx, timeout=timeout)
+            def _bump_idle(_outputs: list, cp=cp) -> None:
+                cp.last_output_at = time.monotonic()
+
+            result = exec_cell_to_disk(
+                client,
+                job.notebook_path,
+                idx,
+                timeout=timeout,
+                on_output=_bump_idle,
+            )
 
             cp.finished_at = time.monotonic()
             elapsed = cp.elapsed or 0.0
@@ -207,7 +224,21 @@ def get_status(notebook_path: str) -> str:
     for idx in job.cell_indices:
         cp = job.cells[idx]
         elapsed_str = f" {cp.elapsed:.1f}s" if cp.elapsed is not None else ""
+        idle_str = ""
+        if cp.status == CellStatus.RUNNING:
+            if cp.idle is not None:
+                idle_str = f" (last output {cp.idle:.1f}s ago)"
+            else:
+                idle_str = " (no output yet)"
         err_str = f" — {cp.error_summary}" if cp.error_summary else ""
-        lines.append(f"  [{idx}] {cp.status.value}{elapsed_str}{err_str}")
+        lines.append(f"  [{idx}] {cp.status.value}{elapsed_str}{idle_str}{err_str}")
 
     return "\n".join(lines)
+
+
+def wait_for_job(notebook_path: str, timeout: float) -> None:
+    """Block up to `timeout` seconds for the active job on this notebook to finish."""
+    job = get_active_job(notebook_path)
+    if job is None or job.thread is None:
+        return
+    job.thread.join(timeout=timeout)

@@ -130,8 +130,13 @@ def exec_cell_to_disk(
     nb_path: str,
     idx: int,
     timeout: int = 120,
+    on_output: Callable[[list], None] | None = None,
 ) -> dict:
-    """Run cell at idx, streaming outputs into the file. Returns summary dict."""
+    """Run cell at idx, streaming outputs into the file. Returns summary dict.
+
+    `on_output` is called (after the disk flush) on every new output, so callers
+    can track activity timestamps for hang detection.
+    """
     nb = read_nb(nb_path)
     cell = nb.cells[idx]
     if cell["cell_type"] != "code":
@@ -141,6 +146,8 @@ def exec_cell_to_disk(
 
     def _on_output(outputs: list) -> None:
         _flush_outputs_to_disk(nb_path, cell_id, outputs)
+        if on_output is not None:
+            on_output(outputs)
 
     outputs = execute_code(client, source, timeout=timeout, on_output=_on_output)
     _flush_outputs_to_disk(nb_path, cell_id, outputs, set_execution_count=True)

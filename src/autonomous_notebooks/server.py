@@ -208,6 +208,25 @@ async def exec_status(notebook_path: str) -> str:
     return jobs.get_status(notebook_path)
 
 
+@mcp.tool()
+async def wait(notebook_path: str, timeout: int = 30) -> str:
+    """Block until the active job finishes or `timeout` seconds elapse.
+
+    Use this instead of sleeping: returns as soon as the job is done, or on
+    timeout so you can inspect progress. The status includes per-cell elapsed
+    time and "last output Xs ago" for the running cell — if idle time keeps
+    climbing across calls, the cell may be hung; if it's low, things are
+    making progress and you can call `wait` again (with a longer timeout).
+    """
+    nb_io.ensure_notebook(notebook_path)
+
+    def _wait() -> str:
+        jobs.wait_for_job(notebook_path, timeout=timeout)
+        return jobs.get_status(notebook_path)
+
+    return await anyio.to_thread.run_sync(_wait)
+
+
 # -- kernel lifecycle --
 
 

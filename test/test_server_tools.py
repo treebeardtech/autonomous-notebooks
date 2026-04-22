@@ -145,6 +145,38 @@ def test_exec_status(tmp_path: Path):
     assert "no execution history" in out
 
 
+def test_wait_returns_when_job_finishes(tmp_path: Path):
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "print('hi')")
+    _run(server.exec_cell(p, index=0))
+    out = _run(server.wait(p, timeout=30))
+    assert "done" in out
+    assert jobs.get_active_job(p) is None
+
+
+def test_wait_times_out_while_running(tmp_path: Path):
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "import time; time.sleep(3)")
+    _run(server.exec_cell(p, index=0, timeout=30))
+    # short wait: job is still running
+    out = _run(server.wait(p, timeout=1))
+    assert "running" in out
+    # drain the job so fixtures clean up cleanly
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        job = jobs.get_active_job(p)
+        if job is None:
+            break
+        if job.thread is not None:
+            job.thread.join(timeout=0.5)
+
+
+def test_wait_on_fresh_notebook(tmp_path: Path):
+    p = _nb(tmp_path)
+    out = _run(server.wait(p, timeout=1))
+    assert "no execution history" in out
+
+
 def test_exec_conflict(tmp_path: Path):
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "import time; time.sleep(2)")

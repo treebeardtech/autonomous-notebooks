@@ -51,6 +51,8 @@ All tools take `notebook_path: str` as their first argument.
 - `exec_all(notebook_path, timeout=120)`
 - `run_scratch(notebook_path, code, timeout=120)` — ephemeral
 - `insert_and_exec(notebook_path, index, source, timeout=120)`
+- `exec_status(notebook_path)` — snapshot of the active or most recent job
+- `wait(notebook_path, timeout=30)` — block until job finishes or timeout; status includes idle time so the agent can tell progress from hang
 
 **Kernel lifecycle**
 - `interrupt(notebook_path)`
