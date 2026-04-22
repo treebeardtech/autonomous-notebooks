@@ -98,3 +98,28 @@ def _ensure_shutdown_hooks():
 Not yet implemented — parked pending a decision on opt-in vs.
 default-on. My lean is opt-in with a simple env var, no CLI flag at
 first.
+
+## Adjacent: surface silent execution failures
+
+Reattach is really a special case of "the kernel did something
+unexpected and the agent is guessing." Another one we've noticed:
+disk-quota exhaustion (or any write-path failure) mid-exec can look
+silent.
+
+Places to audit:
+- `atomic_write_nb` raises OSError — propagates to `_run_job`'s
+  catch-all `except Exception`, which currently records
+  `cp.error_summary = str(exc)` on running/queued cells but doesn't
+  log loudly. Need an explicit `log.error("disk write failed…")`
+  path so it shows up in `nb_mcp.log` and flows through Monitor.
+- The log file's own FileHandler fails open if the FS fills up —
+  subsequent warnings/errors then vanish. Consider a fallback to
+  stderr when the file handler's emit fails.
+- The kernel process itself can die from OOM / disk / SIGKILL.
+  `km.is_alive()` starts returning False; our next exec raises, but
+  the operator should hear about it as a clear error, not a generic
+  exception traceback.
+
+Worth a small hardening pass: every exception in `_run_job` and the
+file handlers should log at ERROR with enough context to identify
+*what* failed (cell idx, notebook path, operation, errno).
