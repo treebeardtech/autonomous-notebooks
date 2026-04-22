@@ -76,11 +76,18 @@ def interrupt(path: str) -> None:
     km.interrupt_kernel()
 
 
+class KernelDeadError(RuntimeError):
+    """Raised when a kernel process has died and can't be reattached to."""
+
+
 def reset_client(path: str) -> BlockingKernelClient:
     """Rebuild the client's ZMQ channels without touching the kernel.
 
     Use to recover from an iopub framing desync (e.g. after heavy output):
     the training process stays running, we just re-subscribe.
+
+    Raises KernelDeadError if the kernel process is gone — callers should
+    surface that as a distinct failure, not a generic recovery error.
     """
     k = _key(path)
     with _lock:
@@ -88,15 +95,26 @@ def reset_client(path: str) -> BlockingKernelClient:
     if entry is None:
         raise ValueError(f"no kernel for {path}")
     km, old_client = entry
+
+    if not km.is_alive():
+        log.error("kernel for %s is dead — cannot reset client", k)
+        raise KernelDeadError(f"kernel for {path} has died")
+
     log.warning("resetting client channels for %s (kernel stays alive)", k)
     try:
         old_client.stop_channels()
     except Exception:
-        log.exception("error stopping old client channels")
+        log.exception("error stopping old client channels for %s", path)
 
     new_client = km.client()
     new_client.start_channels()
-    new_client.wait_for_ready(timeout=10)
+    try:
+        new_client.wait_for_ready(timeout=10)
+    except RuntimeError as exc:
+        # wait_for_ready raises RuntimeError on heartbeat timeout — almost
+        # always means the kernel died while we were reconnecting.
+        log.error("kernel for %s unresponsive after reset: %s", k, exc)
+        raise KernelDeadError(f"kernel for {path} unresponsive after reset") from exc
     with _lock:
         _kernels[k] = (km, new_client)
     log.info("client channels reset for %s", k)

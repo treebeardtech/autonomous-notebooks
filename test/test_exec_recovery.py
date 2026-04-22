@@ -85,3 +85,28 @@ def test_no_recover_fn_means_immediate_desync_marker():
     outputs = execute_code(broken, "doesnt_matter", timeout=10)
     texts = [o["text"] for o in outputs if o["output_type"] == "stream"]
     assert any("iopub desync" in t for t in texts)
+
+
+def test_kernel_died_emits_error_output_and_distinct_marker():
+    """When recover_fn raises KernelDeadError, we emit an nbformat error
+    (so the job is marked ERROR) and a clear 'kernel died' marker — not a
+    generic 'iopub desync' one."""
+    from autonomous_notebooks.kernels import KernelDeadError
+
+    broken = MagicMock()
+    broken.execute.return_value = "xyz"
+    broken.get_iopub_msg.side_effect = ValueError("'<IDS|MSG>' is not in list")
+
+    def recover() -> MagicMock:
+        raise KernelDeadError("kernel for /tmp/x.ipynb has died")
+
+    outputs = execute_code(broken, "doesnt_matter", timeout=10, recover_fn=recover)
+
+    # Has an error output so the outer job marks this cell as errored.
+    errors = [o for o in outputs if o["output_type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["ename"] == "NbMcpKernelDied"
+    # The traceback carries our "kernel died" marker, not "iopub desync".
+    tb = "\n".join(errors[0]["traceback"])
+    assert "kernel died mid-execution" in tb
+    assert "iopub desync" not in tb

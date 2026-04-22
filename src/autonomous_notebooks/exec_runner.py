@@ -118,15 +118,35 @@ def execute_code(
             try:
                 client = recover_fn()
                 log.info("iopub recovered — resuming read loop for msg_id=%s", msg_id)
-            except Exception:
-                log.exception("channel recovery failed")
-                outputs.append(
-                    nbformat.v4.new_output(
-                        "stream",
-                        name="stderr",
-                        text="[nb mcp] iopub desync — channel recovery failed",
+            except Exception as recovery_exc:
+                # Distinguish a dead kernel from a transient ZMQ failure so
+                # the agent sees a clear root cause in the log / Monitor.
+                from autonomous_notebooks.kernels import KernelDeadError
+
+                if isinstance(recovery_exc, KernelDeadError):
+                    log.error("kernel died during cell execution: %s", recovery_exc)
+                    marker = (
+                        "[nb mcp] kernel died mid-execution "
+                        "(OOM / killed / crashed). Use `status()` to check; "
+                        "next exec will start a fresh kernel (all in-memory state lost)."
                     )
-                )
+                    # Emit an nbformat error output so the job is marked
+                    # ERROR and subsequent cells are skipped. Without this
+                    # the job would optimistically continue on a dead kernel.
+                    outputs.append(
+                        nbformat.v4.new_output(
+                            "error",
+                            ename="NbMcpKernelDied",
+                            evalue=str(recovery_exc),
+                            traceback=[marker],
+                        )
+                    )
+                else:
+                    log.exception("channel recovery failed for msg_id=%s", msg_id)
+                    marker = "[nb mcp] iopub desync — channel recovery failed"
+                    outputs.append(
+                        nbformat.v4.new_output("stream", name="stderr", text=marker)
+                    )
                 if on_output:
                     on_output(outputs)
                 break
