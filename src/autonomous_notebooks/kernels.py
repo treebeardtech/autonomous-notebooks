@@ -76,6 +76,33 @@ def interrupt(path: str) -> None:
     km.interrupt_kernel()
 
 
+def reset_client(path: str) -> BlockingKernelClient:
+    """Rebuild the client's ZMQ channels without touching the kernel.
+
+    Use to recover from an iopub framing desync (e.g. after heavy output):
+    the training process stays running, we just re-subscribe.
+    """
+    k = _key(path)
+    with _lock:
+        entry = _kernels.get(k)
+    if entry is None:
+        raise ValueError(f"no kernel for {path}")
+    km, old_client = entry
+    log.warning("resetting client channels for %s (kernel stays alive)", k)
+    try:
+        old_client.stop_channels()
+    except Exception:
+        log.exception("error stopping old client channels")
+
+    new_client = km.client()
+    new_client.start_channels()
+    new_client.wait_for_ready(timeout=10)
+    with _lock:
+        _kernels[k] = (km, new_client)
+    log.info("client channels reset for %s", k)
+    return new_client
+
+
 def shutdown(path: str) -> bool:
     """Stop the kernel for `path`. Returns True if one was running."""
     with _lock:

@@ -182,6 +182,7 @@ async def run_scratch(notebook_path: str, code: str, timeout: int = 120) -> str:
             code,
             timeout=timeout,
             interrupt_fn=lambda: kernels.interrupt(notebook_path),
+            recover_fn=lambda: kernels.reset_client(notebook_path),
         )
         return nb_io.fmt_outputs(outputs, indent="") or "(no output)"
 

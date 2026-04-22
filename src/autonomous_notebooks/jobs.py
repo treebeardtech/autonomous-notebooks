@@ -161,6 +161,9 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
             def _interrupt(path=job.notebook_path) -> None:
                 kernels.interrupt(path)
 
+            def _recover(path=job.notebook_path):
+                return kernels.reset_client(path)
+
             result = exec_cell_to_disk(
                 client,
                 job.notebook_path,
@@ -169,6 +172,7 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 on_output=_bump_idle,
                 running_header=running_header,
                 interrupt_fn=_interrupt,
+                recover_fn=_recover,
             )
 
             cp.finished_at = time.monotonic()

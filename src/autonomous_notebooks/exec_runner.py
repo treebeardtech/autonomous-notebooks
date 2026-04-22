@@ -43,6 +43,7 @@ def execute_code(
     timeout: int = 120,
     on_output: Callable[[list], None] | None = None,
     interrupt_fn: Callable[[], None] | None = None,
+    recover_fn: Callable[[], BlockingKernelClient] | None = None,
 ) -> list:
     """Execute `code` on `client`, return list of nbformat output dicts.
 
@@ -50,6 +51,11 @@ def execute_code(
     between messages — a cell that streams output continuously still gets
     killed on schedule. When the deadline fires, `interrupt_fn` is called (if
     given) to tell the kernel to stop, and a timeout marker is appended.
+
+    `recover_fn`, if given, is called when iopub parsing throws unexpectedly
+    (ZMQ framing desync under heavy output). It should rebuild the client's
+    channels without killing the kernel and return the new client. We allow
+    up to 3 such recoveries before giving up.
 
     If `on_output` is provided, it's called after each new output with the
     full outputs list so far.
@@ -60,6 +66,8 @@ def execute_code(
     # Poll at least once per second so we notice the deadline even while the
     # cell is chatty (each get_iopub_msg returns quickly when messages stream).
     poll = 1.0
+    max_recovers = 3
+    recovers = 0
 
     while True:
         remaining = deadline - time.monotonic()
@@ -85,6 +93,43 @@ def execute_code(
             msg = client.get_iopub_msg(timeout=min(remaining, poll))
         except (TimeoutError, queue.Empty):
             # No message within the poll window — loop to check deadline.
+            continue
+        except Exception as exc:
+            # Typically a ZMQ framing desync: ValueError('<IDS|MSG>' is not in list).
+            # Under heavy iopub traffic one bad frame will keep firing unless we
+            # rebuild channels. Kernel stays alive; we re-subscribe.
+            recovers += 1
+            log.warning("iopub read failed (%d/%d): %s", recovers, max_recovers, exc)
+            if recover_fn is None or recovers > max_recovers:
+                outputs.append(
+                    nbformat.v4.new_output(
+                        "stream",
+                        name="stderr",
+                        text=(
+                            "[nb mcp] iopub desync — lost connection to kernel. "
+                            "Output may be incomplete. The kernel is likely still "
+                            "running; use exec_status / read_cell to check."
+                        ),
+                    )
+                )
+                if on_output:
+                    on_output(outputs)
+                break
+            try:
+                client = recover_fn()
+                log.info("iopub recovered — resuming read loop for msg_id=%s", msg_id)
+            except Exception:
+                log.exception("channel recovery failed")
+                outputs.append(
+                    nbformat.v4.new_output(
+                        "stream",
+                        name="stderr",
+                        text="[nb mcp] iopub desync — channel recovery failed",
+                    )
+                )
+                if on_output:
+                    on_output(outputs)
+                break
             continue
 
         if msg["parent_header"].get("msg_id") != msg_id:
@@ -176,6 +221,7 @@ def exec_cell_to_disk(
     on_output: Callable[[list], None] | None = None,
     running_header: str | None = None,
     interrupt_fn: Callable[[], None] | None = None,
+    recover_fn: Callable[[], BlockingKernelClient] | None = None,
 ) -> dict:
     """Run cell at idx, streaming outputs into the file. Returns summary dict.
 
@@ -219,6 +265,7 @@ def exec_cell_to_disk(
         timeout=timeout,
         on_output=_on_output,
         interrupt_fn=interrupt_fn,
+        recover_fn=recover_fn,
     )
     _flush_outputs_to_disk(nb_path, cell_id, outputs, set_execution_count=True)
 
