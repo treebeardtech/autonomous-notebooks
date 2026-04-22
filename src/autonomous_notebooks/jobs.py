@@ -10,6 +10,7 @@ from datetime import datetime
 import nbformat
 
 from autonomous_notebooks import kernels
+from autonomous_notebooks._log import get_logger
 from autonomous_notebooks.exec_runner import (
     exec_cell_to_disk,
     mark_cells_status,
@@ -19,6 +20,8 @@ from autonomous_notebooks.nb_io import (
     atomic_write_nb,
     read_nb,
 )
+
+log = get_logger()
 
 
 class CellStatus(enum.Enum):
@@ -114,6 +117,13 @@ def submit_execution(
         _active[key] = job
 
     mark_cells_status(notebook_path, cell_indices, f"[nb mcp] ⏳ Queued at {_now_ts()}")
+    log.info(
+        "job %s submitted: %s (%d cells: %s)",
+        job.job_id,
+        notebook_path,
+        len(cell_indices),
+        cell_indices,
+    )
 
     t = threading.Thread(
         target=_run_job,
@@ -141,6 +151,9 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
             running_header = (
                 f"[nb mcp] ▶ Running ({pos + 1}/{total}, started {started_ts})\n"
             )
+            log.info(
+                "job %s cell [%d] running (%d/%d)", job.job_id, idx, pos + 1, total
+            )
 
             def _bump_idle(_outputs: list, cp=cp) -> None:
                 cp.last_output_at = time.monotonic()
@@ -161,6 +174,13 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
             if result["had_error"]:
                 cp.status = CellStatus.ERROR
                 cp.error_summary = _extract_error(result["outputs"])
+                log.error(
+                    "job %s cell [%d] errored after %.1fs: %s",
+                    job.job_id,
+                    idx,
+                    elapsed,
+                    cp.error_summary,
+                )
                 _append_status_line(
                     job.notebook_path,
                     idx,
@@ -175,11 +195,17 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                         remaining_idx,
                         "[nb mcp] ⊘ Skipped (earlier cell errored)",
                     )
+                log.info(
+                    "job %s halted — %d cells skipped",
+                    job.job_id,
+                    len(job.cell_indices) - pos - 1,
+                )
 
                 job.state = JobState.ERROR
                 return
             else:
                 cp.status = CellStatus.DONE
+                log.info("job %s cell [%d] done in %.1fs", job.job_id, idx, elapsed)
                 _append_status_line(
                     job.notebook_path,
                     idx,
@@ -187,8 +213,10 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 )
 
         job.state = JobState.DONE
+        log.info("job %s complete", job.job_id)
 
     except Exception as exc:
+        log.exception("job %s crashed: %s", job.job_id, exc)
         job.state = JobState.ERROR
         for cp in job.cells.values():
             if cp.status in (CellStatus.QUEUED, CellStatus.RUNNING):

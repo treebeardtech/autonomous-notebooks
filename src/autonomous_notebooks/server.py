@@ -9,8 +9,10 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 
 from autonomous_notebooks import jobs, kernels, nb_io
+from autonomous_notebooks._log import get_logger
 from autonomous_notebooks.exec_runner import execute_code
 
+log = get_logger()
 mcp = FastMCP("autonomous-notebooks")
 
 
@@ -235,6 +237,7 @@ def interrupt(notebook_path: str) -> str:
     """Interrupt a running cell on the notebook's kernel (sends SIGINT)."""
     if not kernels.is_running(notebook_path):
         return f"no kernel running for {notebook_path}"
+    log.info("interrupt requested for %s", notebook_path)
     kernels.interrupt(notebook_path)
     return "interrupt sent"
 
@@ -247,6 +250,7 @@ def shutdown_kernel(notebook_path: str) -> str:
 
 
 def main() -> None:
+    log.info("nb mcp server starting")
     mcp.run()
 
 

@@ -6,11 +6,14 @@ from collections.abc import Callable
 import nbformat
 from jupyter_client.blocking import BlockingKernelClient
 
+from autonomous_notebooks._log import get_logger
 from autonomous_notebooks.nb_io import (
     atomic_write_nb,
     find_cell_by_id,
     read_nb,
 )
+
+log = get_logger()
 
 
 def write_cell_status(nb_path: str, idx: int, status: str) -> None:
@@ -124,14 +127,11 @@ def _flush_outputs_to_disk(
         if hit:
             target = hit[1]
     if target is None:
-        # Should not happen: exec_cell_to_disk backfills ids before streaming.
-        # If it does, surface it loudly rather than silently dropping outputs.
-        import sys
-
-        print(
-            f"warning: nb mcp could not find cell (id={cell_id!r}) in {nb_path}; "
-            f"dropped {len(outputs)} outputs",
-            file=sys.stderr,
+        log.warning(
+            "could not find cell (id=%r) in %s; dropped %d outputs",
+            cell_id,
+            nb_path,
+            len(outputs),
         )
         return
     target["outputs"] = list(outputs)

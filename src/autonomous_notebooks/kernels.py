@@ -14,6 +14,9 @@ from pathlib import Path
 from jupyter_client import KernelManager
 from jupyter_client.blocking import BlockingKernelClient
 
+from autonomous_notebooks._log import get_logger
+
+log = get_logger()
 _lock = threading.Lock()
 _kernels: dict[str, tuple[KernelManager, BlockingKernelClient]] = {}
 _shutdown_registered = False
@@ -36,6 +39,7 @@ def get_or_start(path: str) -> BlockingKernelClient:
                 return client
             _kernels.pop(k, None)
 
+    log.info("starting kernel for %s", k)
     km = KernelManager()
     km.start_kernel()
     client = km.client()
@@ -45,6 +49,7 @@ def get_or_start(path: str) -> BlockingKernelClient:
     with _lock:
         race = _kernels.get(k)
         if race is not None and race[0].is_alive():
+            log.info("kernel race for %s — discarding duplicate", k)
             try:
                 client.stop_channels()
                 km.shutdown_kernel(now=True)
@@ -52,6 +57,7 @@ def get_or_start(path: str) -> BlockingKernelClient:
                 pass
             return race[1]
         _kernels[k] = (km, client)
+    log.info("kernel ready for %s", k)
     return client
 
 
@@ -80,11 +86,12 @@ def shutdown(path: str) -> bool:
     try:
         client.stop_channels()
     except Exception:
-        pass
+        log.exception("error stopping client channels for %s", path)
     try:
         km.shutdown_kernel(now=True)
     except Exception:
-        pass
+        log.exception("error shutting down kernel for %s", path)
+    log.info("kernel stopped for %s", _key(path))
     return True
 
 

@@ -71,6 +71,10 @@ nb mcp       # run the stdio MCP server
 nb cleanup   # kill stray ipykernel processes and delete .nb/
 ```
 
+## 4a. Logging
+
+Server writes to `./.nb_mcp.log` (CWD) at INFO level by default. Covers job/cell lifecycle, kernel start/stop, dropped-output warnings, and unhandled exceptions. Override via `NB_MCP_LOG_LEVEL` (DEBUG/INFO/WARNING/ERROR) or `NB_MCP_LOG_PATH`.
+
 ---
 
 ## 5. Output capture
