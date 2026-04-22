@@ -248,6 +248,39 @@ def test_progress_lines_written_to_log(tmp_path: Path, monkeypatch):
     assert len(progress_lines) < 20, f"progress not throttled: {len(progress_lines)}"
 
 
+def test_heartbeat_for_silent_cell(tmp_path: Path, monkeypatch):
+    """A cell with no output should still emit 'still running' heartbeats."""
+    import importlib
+    import logging
+
+    log_path = tmp_path / "nb_mcp.log"
+    monkeypatch.setenv("NB_MCP_LOG_PATH", str(log_path))
+    monkeypatch.setenv("NB_MCP_LOG_LEVEL", "INFO")
+    monkeypatch.setenv("NB_MCP_PROGRESS_INTERVAL_SEC", "0.3")
+
+    from autonomous_notebooks import _log
+
+    importlib.reload(_log)
+    logger = logging.getLogger("nb_mcp")
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    _log._configured = False
+    _log.get_logger()
+    from autonomous_notebooks import exec_runner as _er
+    from autonomous_notebooks import jobs as _jb
+
+    _er.log = logger
+    _jb.log = logger
+
+    p = _nb(tmp_path, "silent.ipynb")
+    server.insert_cell(p, 0, "import time; time.sleep(1.2)")
+    _run_and_wait(server.exec_cell(p, index=0, timeout=30, block_for=0), p)
+
+    body = log_path.read_text()
+    heartbeats = [line for line in body.splitlines() if "still running" in line]
+    assert len(heartbeats) >= 2, body
+
+
 def test_exec_cell_without_id_streams_output(tmp_path: Path):
     """Notebooks written outside the MCP may lack cell ids — exec must still flush outputs."""
     import json

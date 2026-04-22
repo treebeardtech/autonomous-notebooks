@@ -86,11 +86,18 @@ job/cell lifecycle, kernel start/stop, dropped-output warnings, and
 unhandled exceptions. Override via `NB_MCP_LOG_LEVEL`
 (DEBUG/INFO/WARNING/ERROR) or `NB_MCP_LOG_PATH`.
 
-While a cell is running, the last line of fresh stream output is
-also logged as `job X cell [N] out: …` — throttled to one line every
-10 seconds per cell so `nb watch` → Monitor produces a steady
-notification stream without a firehose. Tune or disable via
-`NB_MCP_PROGRESS_INTERVAL_SEC` (default 10.0, 0 disables).
+While a cell is running, two kinds of progress line land in the log —
+both matching the `nb watch` → Monitor filter:
+
+- `job X cell [N] out: …` — the last line of fresh stream output,
+  throttled to one per `NB_MCP_PROGRESS_INTERVAL_SEC` (default 10s).
+- `job X cell [N] still running (Ns elapsed)` — heartbeat that fires
+  only if the cell has produced no output AND the progress emitter
+  hasn't logged within the interval. Keeps Monitor pinging the agent
+  during silent work (`time.sleep`, GPU compute, blocking I/O) so a
+  healthy-but-quiet cell doesn't look hung.
+
+Set `NB_MCP_PROGRESS_INTERVAL_SEC=0` to disable both.
 
 ---
 

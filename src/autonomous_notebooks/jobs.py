@@ -180,7 +180,7 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 "job %s cell [%d] running (%d/%d)", job.job_id, idx, pos + 1, total
             )
 
-            progress = {"last_logged": 0.0, "last_count": 0}
+            progress = {"last_emitted": 0.0, "last_count": 0}
             interval = _progress_interval()
 
             def _on_output(
@@ -197,12 +197,12 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
                 if len(outputs) == st["last_count"]:
                     return
                 now = time.monotonic()
-                if now - st["last_logged"] < interval:
+                if now - st["last_emitted"] < interval:
                     return
                 tail = _output_tail(outputs)
                 if tail is None:
                     return
-                st["last_logged"] = now
+                st["last_emitted"] = now
                 st["last_count"] = len(outputs)
                 log.info("job %s cell [%d] out: %s", job_id, idx, tail)
 
@@ -212,16 +212,60 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
             def _recover(path=job.notebook_path):
                 return kernels.reset_client(path)
 
-            result = exec_cell_to_disk(
-                client,
-                job.notebook_path,
-                idx,
-                timeout=timeout,
-                on_output=_on_output,
-                running_header=running_header,
-                interrupt_fn=_interrupt,
-                recover_fn=_recover,
+            # Heartbeat: if the cell is silent for `interval` AND the progress
+            # emitter hasn't logged in `interval` either, log "still running Ns".
+            # Distinct check from the progress emitter so a chatty cell's
+            # output always wins — heartbeat only kicks in for genuine silence
+            # (time.sleep, GPU compute, blocking I/O).
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat(
+                cp=cp,
+                idx=idx,
+                job_id=job.job_id,
+                st=progress,
+                interval=interval,
+                stop=heartbeat_stop,
+            ) -> None:
+                if interval <= 0:
+                    return
+                while not stop.wait(interval):
+                    now = time.monotonic()
+                    if now - st["last_emitted"] < interval:
+                        continue
+                    if (
+                        cp.last_output_at is not None
+                        and now - cp.last_output_at < interval
+                    ):
+                        continue
+                    started = cp.started_at or now
+                    elapsed = now - started
+                    st["last_emitted"] = now
+                    log.info(
+                        "job %s cell [%d] still running (%.0fs elapsed)",
+                        job_id,
+                        idx,
+                        elapsed,
+                    )
+
+            hb_thread = threading.Thread(
+                target=_heartbeat, daemon=True, name=f"nb-hb-{job.job_id}-{idx}"
             )
+            hb_thread.start()
+            try:
+                result = exec_cell_to_disk(
+                    client,
+                    job.notebook_path,
+                    idx,
+                    timeout=timeout,
+                    on_output=_on_output,
+                    running_header=running_header,
+                    interrupt_fn=_interrupt,
+                    recover_fn=_recover,
+                )
+            finally:
+                heartbeat_stop.set()
+                hb_thread.join(timeout=1)
 
             cp.finished_at = time.monotonic()
             elapsed = cp.elapsed or 0.0
