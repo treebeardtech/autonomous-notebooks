@@ -133,6 +133,22 @@ def shutdown_all() -> int:
     return n
 
 
+def list_all() -> list[tuple[str, bool, int | None]]:
+    """Snapshot of every registered kernel: (resolved_path, is_alive, pid)."""
+    with _lock:
+        items = list(_kernels.items())
+    out: list[tuple[str, bool, int | None]] = []
+    for path, (km, _client) in items:
+        pid: int | None = None
+        try:
+            if km.provisioner is not None:
+                pid = km.provisioner.pid  # type: ignore[attr-defined]
+        except Exception:
+            pid = None
+        out.append((path, km.is_alive(), pid))
+    return out
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

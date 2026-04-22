@@ -29,6 +29,71 @@ def cmd_cleanup(_args: argparse.Namespace) -> None:
         print(f"removed {nb_dir.resolve()}")
 
 
+def cmd_status(args: argparse.Namespace) -> None:
+    """Summarise recent job activity from the log + any live ipykernel processes."""
+    log_path = Path(os.environ.get("NB_MCP_LOG_PATH", ".nb_mcp.log"))
+
+    # Live ipykernel processes — these exist whether or not our MCP is up.
+    ipy_pids = _list_ipykernels()
+    if ipy_pids:
+        print(f"ipykernel processes ({len(ipy_pids)}): {', '.join(map(str, ipy_pids))}")
+    else:
+        print("ipykernel processes: none")
+
+    if not log_path.exists():
+        print(f"\nno log file at {log_path} — MCP may not have been started here")
+        return
+
+    # Walk the log, tracking the state of each job we've seen.
+    jobs: dict[str, dict] = {}
+    order: list[str] = []
+    submit_re = re.compile(r"job (\w+) submitted: (\S+)")
+    finish_re = re.compile(r"job (\w+) (complete|crashed)")
+
+    for line in log_path.read_text().splitlines():
+        m = submit_re.search(line)
+        if m:
+            jid, path = m.group(1), m.group(2)
+            jobs[jid] = {"path": path, "state": "running", "line": line}
+            order.append(jid)
+            continue
+        m = finish_re.search(line)
+        if m:
+            jid = m.group(1)
+            if jid in jobs:
+                jobs[jid]["state"] = "done" if m.group(2) == "complete" else "crashed"
+                jobs[jid]["line"] = line
+
+    running = [jid for jid in order if jobs[jid]["state"] == "running"]
+    finished = [jid for jid in order if jobs[jid]["state"] != "running"]
+
+    print(f"\nActive jobs (from log) ({len(running)}):")
+    for jid in running:
+        j = jobs[jid]
+        print(f"  job {jid}  {j['path']}")
+    if not running:
+        print("  (none)")
+
+    tail = finished[-5:]
+    if tail:
+        print(f"\nRecent finished jobs ({len(tail)}):")
+        for jid in tail:
+            j = jobs[jid]
+            print(f"  job {jid}  {j['path']}  {j['state']}")
+
+
+def _list_ipykernels() -> list[int]:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-u", str(os.getuid()), "-f", "ipykernel_launcher"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+    return [int(p) for p in out.stdout.split() if p.strip()]
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     """Tail the nb-mcp log for a single job; exit when the job ends.
 
@@ -169,6 +234,11 @@ def main() -> None:
     sub.add_parser(
         "cleanup", help="kill stray kernels and remove leftover .nb/ directory"
     )
+    sub.add_parser(
+        "status",
+        help="summarise recent jobs from the log + live ipykernel processes. "
+        "For in-memory state of a running MCP, use the `status` MCP tool instead.",
+    )
 
     watch = sub.add_parser(
         "watch",
@@ -199,7 +269,12 @@ def main() -> None:
     if args.cmd == "watch" and not args.job and not args.path:
         watch.error("provide at least one of --job or --path")
 
-    {"mcp": cmd_mcp, "cleanup": cmd_cleanup, "watch": cmd_watch}[args.cmd](args)
+    {
+        "mcp": cmd_mcp,
+        "cleanup": cmd_cleanup,
+        "watch": cmd_watch,
+        "status": cmd_status,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":

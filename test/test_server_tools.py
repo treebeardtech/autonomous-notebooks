@@ -145,6 +145,25 @@ def test_exec_status(tmp_path: Path):
     assert "no execution history" in out
 
 
+def test_global_status_with_no_activity():
+    out = _run(server.status())
+    assert "Kernels: none" in out
+    assert "Active jobs: none" in out
+
+
+def test_global_status_reports_kernel_and_recent_job(tmp_path: Path):
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "print('hi')")
+    _run_and_wait(server.exec_cell(p, index=0, block_for=0), p)
+    out = _run(server.status())
+    # kernel from the run is still registered
+    assert "Kernels (" in out
+    assert str(Path(p).resolve()) in out
+    # job shows up in recent list
+    assert "Recent jobs" in out
+    assert "done" in out
+
+
 def test_short_job_returns_inline_within_block_for(tmp_path: Path):
     """A quick cell completes inside block_for and returns status, not a Monitor hint."""
     p = _nb(tmp_path)

@@ -352,6 +352,21 @@ def get_active_job(notebook_path: str) -> Job | None:
         return _active.get(key)
 
 
+def list_all_active() -> list[Job]:
+    with _lock:
+        return list(_active.values())
+
+
+def list_all_finished(limit: int = 5) -> list[Job]:
+    with _lock:
+        jobs_by_time = sorted(
+            _finished.values(),
+            key=lambda j: j.finished_at or 0,
+            reverse=True,
+        )
+    return jobs_by_time[:limit]
+
+
 def get_status(notebook_path: str) -> str:
     """Human-readable status of the active or most recent job."""
     key = _nb_key(notebook_path)
@@ -375,5 +390,55 @@ def get_status(notebook_path: str) -> str:
                 idle_str = " (no output yet)"
         err_str = f" — {cp.error_summary}" if cp.error_summary else ""
         lines.append(f"  [{idx}] {cp.status.value}{elapsed_str}{idle_str}{err_str}")
+
+    return "\n".join(lines)
+
+
+def format_global_status() -> str:
+    """Multi-section snapshot: every kernel, every active/recent job."""
+    lines: list[str] = []
+
+    # Kernels
+    kns = kernels.list_all()
+    if kns:
+        lines.append(f"Kernels ({len(kns)}):")
+        for path, alive, pid in kns:
+            alive_str = "alive" if alive else "dead"
+            pid_str = f" pid={pid}" if pid else ""
+            lines.append(f"  [{alive_str}]{pid_str}  {path}")
+    else:
+        lines.append("Kernels: none")
+
+    # Active jobs
+    active = list_all_active()
+    if active:
+        lines.append("")
+        lines.append(f"Active jobs ({len(active)}):")
+        for job in active:
+            running = sum(
+                1 for cp in job.cells.values() if cp.status == CellStatus.RUNNING
+            )
+            done = sum(1 for cp in job.cells.values() if cp.status == CellStatus.DONE)
+            total = len(job.cells)
+            age = time.time() - job.created_at
+            lines.append(
+                f"  job {job.job_id}  {job.notebook_path}  "
+                f"({done}/{total} done, {running} running, {age:.0f}s since submit)"
+            )
+    else:
+        lines.append("")
+        lines.append("Active jobs: none")
+
+    # Recent finished
+    recent = list_all_finished(limit=5)
+    if recent:
+        lines.append("")
+        lines.append("Recent jobs (last 5):")
+        for job in recent:
+            ago = time.time() - (job.finished_at or time.time())
+            lines.append(
+                f"  job {job.job_id}  {job.notebook_path}  "
+                f"{job.state.value} (finished {ago:.0f}s ago)"
+            )
 
     return "\n".join(lines)

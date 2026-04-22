@@ -80,6 +80,36 @@ def test_watch_prints_matching_events_and_exits(tmp_path: Path) -> None:
     assert "xyz999" not in stdout
 
 
+def test_status_reports_jobs_from_log(tmp_path: Path) -> None:
+    log = tmp_path / "nb_mcp.log"
+    log.write_text(
+        "\n".join(
+            [
+                "2026-04-22 10:00:00+0000 INFO    nb_mcp: job aaa submitted: a.ipynb (1 cells: [0])",
+                "2026-04-22 10:00:01+0000 INFO    nb_mcp: job aaa complete",
+                "2026-04-22 10:00:02+0000 INFO    nb_mcp: job bbb submitted: b.ipynb (2 cells: [0, 1])",
+            ]
+        )
+        + "\n"
+    )
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "autonomous_notebooks.cli", "status"],
+        capture_output=True,
+        text=True,
+        env={
+            "NB_MCP_LOG_PATH": str(log),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PYTHONPATH": str(Path(__file__).parent.parent / "src"),
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Active jobs (from log) (1)" in proc.stdout
+    assert "job bbb  b.ipynb" in proc.stdout
+    assert "Recent finished jobs" in proc.stdout
+    assert "job aaa  a.ipynb  done" in proc.stdout
+
+
 def test_watch_times_out_if_no_matching_job(tmp_path: Path) -> None:
     log = tmp_path / "nb_mcp.log"
     log.write_text("2026-04-22 10:00:00+0000 INFO    nb_mcp: unrelated content\n")

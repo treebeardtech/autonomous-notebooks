@@ -52,6 +52,7 @@ All tools take `notebook_path: str` as their first argument.
 - `run_scratch(notebook_path, code, timeout=120)` — ephemeral
 - `insert_and_exec(notebook_path, index, source, timeout=120, block_for=10)`
 - `exec_status(notebook_path)` — snapshot of the active or most recent job
+- `status()` — **global** snapshot: every kernel + every active/recent job (no path arg)
 
 The non-scratch exec tools block for up to `block_for` seconds (default
 10). If the job finishes in time, the response is the full status inline.
@@ -75,6 +76,9 @@ Minimal. Primary interface is MCP.
 ```
 nb mcp                              # run the stdio MCP server
 nb cleanup                          # kill stray ipykernel processes and delete .nb/
+nb status                           # summarise recent jobs from the log + live
+                                    # ipykernel processes. For the running MCP's
+                                    # in-memory state, use the `status` MCP tool.
 nb watch --job <id> [--path <nb>]   # tail .nb_mcp.log for one job, exit when done.
                                     # emit one line per event — designed for Monitor.
 ```

@@ -271,6 +271,15 @@ async def exec_status(notebook_path: str) -> str:
     return jobs.get_status(notebook_path)
 
 
+@mcp.tool()
+async def status() -> str:
+    """Global snapshot — every kernel and every active/recent job in this MCP server.
+
+    Use when you need an overview regardless of which notebook file you care about.
+    """
+    return jobs.format_global_status()
+
+
 # -- kernel lifecycle --
 
 
