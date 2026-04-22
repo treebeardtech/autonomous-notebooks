@@ -46,17 +46,19 @@ All tools take `notebook_path: str` as their first argument.
 - `clear_outputs(notebook_path, index?)`
 
 **Exec (auto-starts kernel)**
-- `exec_cell(notebook_path, index?, cell_id?, timeout=120)`
-- `exec_range(notebook_path, start, end, timeout=120)`
-- `exec_all(notebook_path, timeout=120)`
+- `exec_cell(notebook_path, index?, cell_id?, timeout=120, block_for=10)`
+- `exec_range(notebook_path, start, end, timeout=120, block_for=10)`
+- `exec_all(notebook_path, timeout=120, block_for=10)`
 - `run_scratch(notebook_path, code, timeout=120)` — ephemeral
-- `insert_and_exec(notebook_path, index, source, timeout=120)`
+- `insert_and_exec(notebook_path, index, source, timeout=120, block_for=10)`
 - `exec_status(notebook_path)` — snapshot of the active or most recent job
 
-Non-scratch exec tools return a Monitor-ready hint, e.g.
+The non-scratch exec tools block for up to `block_for` seconds (default
+10). If the job finishes in time, the response is the full status inline.
+Otherwise the response is a ready-to-use Monitor command, e.g.
 `Monitor(command='uv run nb watch --job abc123 --path nb.ipynb')`. The
 agent pairs that with Claude Code's Monitor tool to stream progress
-without blocking the conversation.
+without blocking the conversation. Set `block_for=0` for fire-and-forget.
 
 **Kernel lifecycle**
 - `interrupt(notebook_path)`

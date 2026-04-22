@@ -145,14 +145,41 @@ def test_exec_status(tmp_path: Path):
     assert "no execution history" in out
 
 
-def test_exec_response_includes_monitor_hint(tmp_path: Path):
+def test_short_job_returns_inline_within_block_for(tmp_path: Path):
+    """A quick cell completes inside block_for and returns status, not a Monitor hint."""
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "print('hi')")
-    out = _run(server.exec_cell(p, index=0))
+    out = _run(server.exec_cell(p, index=0, block_for=10))
+    assert "done" in out
+    assert "uv run nb watch" not in out
+    assert jobs.get_active_job(p) is None
+
+
+def test_long_job_returns_monitor_hint_after_block_for(tmp_path: Path):
+    """A cell still running after block_for seconds falls back to the Monitor hint."""
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "import time; time.sleep(3)")
+    out = _run(server.exec_cell(p, index=0, timeout=30, block_for=1))
     assert "uv run nb watch" in out
     assert "--job" in out
     # Drain the active job so fixtures can clean up.
     deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        job = jobs.get_active_job(p)
+        if job is None:
+            break
+        if job.thread is not None:
+            job.thread.join(timeout=0.5)
+
+
+def test_block_for_zero_never_blocks(tmp_path: Path):
+    """block_for=0 should skip the join and always return the Monitor hint."""
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "print('instant')")
+    out = _run(server.exec_cell(p, index=0, block_for=0))
+    assert "uv run nb watch" in out
+    # Drain.
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         job = jobs.get_active_job(p)
         if job is None:
@@ -203,9 +230,10 @@ def test_exec_conflict(tmp_path: Path):
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "import time; time.sleep(2)")
     server.insert_cell(p, 1, "print('done')")
-    _run(server.exec_all(p))
+    # block_for=0 so this returns while the first job is still running.
+    _run(server.exec_all(p, block_for=0))
     # second exec on same notebook should report conflict
-    result = _run(server.exec_cell(p, index=0))
+    result = _run(server.exec_cell(p, index=0, block_for=0))
     assert "already has a running job" in result
     # wait for the first job to finish
     deadline = time.monotonic() + 30
