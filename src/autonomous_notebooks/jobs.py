@@ -1,0 +1,444 @@
+"""Background execution jobs. One active job per notebook, backed by a daemon thread."""
+
+import enum
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import nbformat
+
+from autonomous_notebooks import kernels
+from autonomous_notebooks._log import get_logger
+from autonomous_notebooks.exec_runner import (
+    exec_cell_to_disk,
+    mark_cells_status,
+    write_cell_status,
+)
+from autonomous_notebooks.nb_io import (
+    atomic_write_nb,
+    read_nb,
+)
+
+log = get_logger()
+
+
+class CellStatus(enum.Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    ERROR = "error"
+    SKIPPED = "skipped"
+
+
+class JobState(enum.Enum):
+    RUNNING = "running"
+    DONE = "done"
+    ERROR = "error"
+
+
+@dataclass
+class CellProgress:
+    index: int
+    status: CellStatus = CellStatus.QUEUED
+    started_at: float | None = None
+    finished_at: float | None = None
+    last_output_at: float | None = None
+    error_summary: str | None = None
+
+    @property
+    def elapsed(self) -> float | None:
+        if self.started_at is None:
+            return None
+        end = self.finished_at or time.monotonic()
+        return end - self.started_at
+
+    @property
+    def idle(self) -> float | None:
+        """Seconds since the last output, while running. None if finished or never produced output."""
+        if self.last_output_at is None or self.finished_at is not None:
+            return None
+        return time.monotonic() - self.last_output_at
+
+
+@dataclass
+class Job:
+    job_id: str
+    notebook_path: str
+    cell_indices: list[int]
+    state: JobState = JobState.RUNNING
+    cells: dict[int, CellProgress] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    thread: threading.Thread | None = field(default=None, repr=False)
+
+
+_lock = threading.Lock()
+_active: dict[str, Job] = {}
+_finished: dict[str, Job] = {}
+
+
+def _now_ts() -> str:
+    """Local wall-clock with timezone — unambiguous across remote servers."""
+    now = datetime.now().astimezone()
+    with_name = now.strftime("%H:%M:%S %Z").rstrip()
+    return with_name or now.strftime("%H:%M:%S %z")
+
+
+def _progress_interval() -> float:
+    """Minimum seconds between progress log lines per cell. 0 disables progress logging."""
+    raw = os.environ.get("NB_MCP_PROGRESS_INTERVAL_SEC")
+    if raw is None:
+        return 10.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 10.0
+
+
+def _output_tail(outputs: list, max_len: int = 200) -> str | None:
+    """Last non-empty stream line across recent outputs, truncated. None if no text."""
+    for out in reversed(outputs):
+        if out.get("output_type") != "stream":
+            continue
+        text = out.get("text", "")
+        for line in reversed(text.rstrip("\n").split("\n")):
+            line = line.strip()
+            if line:
+                return line if len(line) <= max_len else line[: max_len - 3] + "..."
+    return None
+
+
+def _nb_key(path: str) -> str:
+    from pathlib import Path
+
+    return str(Path(path).resolve())
+
+
+def submit_execution(
+    notebook_path: str,
+    cell_indices: list[int],
+    timeout: int = 120,
+) -> Job:
+    """Start a background execution job. Returns immediately."""
+    key = _nb_key(notebook_path)
+
+    with _lock:
+        existing = _active.get(key)
+        if existing is not None:
+            raise RuntimeError(
+                f"notebook already has a running job ({existing.job_id}). "
+                "Wait for it to finish, check exec_status, or interrupt the kernel."
+            )
+
+        job = Job(
+            job_id=uuid.uuid4().hex[:8],
+            notebook_path=notebook_path,
+            cell_indices=list(cell_indices),
+            cells={idx: CellProgress(index=idx) for idx in cell_indices},
+        )
+        _active[key] = job
+
+    mark_cells_status(notebook_path, cell_indices, f"[nb mcp] ⏳ Queued at {_now_ts()}")
+    log.info(
+        "job %s submitted: %s (%d cells: %s)",
+        job.job_id,
+        notebook_path,
+        len(cell_indices),
+        cell_indices,
+    )
+
+    t = threading.Thread(
+        target=_run_job,
+        args=(job, key, timeout),
+        daemon=True,
+        name=f"nb-exec-{job.job_id}",
+    )
+    job.thread = t
+    t.start()
+    return job
+
+
+def _run_job(job: Job, key: str, timeout: int) -> None:
+    """Worker thread: execute cells sequentially, updating notebook and job state."""
+    total = len(job.cell_indices)
+    try:
+        client = kernels.get_or_start(job.notebook_path)
+
+        for pos, idx in enumerate(job.cell_indices):
+            cp = job.cells[idx]
+            cp.status = CellStatus.RUNNING
+            cp.started_at = time.monotonic()
+
+            started_ts = _now_ts()
+            running_header = (
+                f"[nb mcp] ▶ Running ({pos + 1}/{total}, started {started_ts})\n"
+            )
+            log.info(
+                "job %s cell [%d] running (%d/%d)", job.job_id, idx, pos + 1, total
+            )
+
+            progress = {"last_emitted": 0.0, "last_count": 0}
+            interval = _progress_interval()
+
+            def _on_output(
+                outputs: list,
+                cp=cp,
+                idx=idx,
+                job_id=job.job_id,
+                st=progress,
+                interval=interval,
+            ) -> None:
+                cp.last_output_at = time.monotonic()
+                if interval <= 0:
+                    return
+                if len(outputs) == st["last_count"]:
+                    return
+                now = time.monotonic()
+                if now - st["last_emitted"] < interval:
+                    return
+                tail = _output_tail(outputs)
+                if tail is None:
+                    return
+                st["last_emitted"] = now
+                st["last_count"] = len(outputs)
+                log.info("job %s cell [%d] out: %s", job_id, idx, tail)
+
+            def _interrupt(path=job.notebook_path) -> None:
+                kernels.interrupt(path)
+
+            def _recover(path=job.notebook_path):
+                return kernels.reset_client(path)
+
+            # Heartbeat: if the cell is silent for `interval` AND the progress
+            # emitter hasn't logged in `interval` either, log "still running Ns".
+            # Distinct check from the progress emitter so a chatty cell's
+            # output always wins — heartbeat only kicks in for genuine silence
+            # (time.sleep, GPU compute, blocking I/O).
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat(
+                cp=cp,
+                idx=idx,
+                job_id=job.job_id,
+                st=progress,
+                interval=interval,
+                stop=heartbeat_stop,
+            ) -> None:
+                if interval <= 0:
+                    return
+                while not stop.wait(interval):
+                    now = time.monotonic()
+                    if now - st["last_emitted"] < interval:
+                        continue
+                    if (
+                        cp.last_output_at is not None
+                        and now - cp.last_output_at < interval
+                    ):
+                        continue
+                    started = cp.started_at or now
+                    elapsed = now - started
+                    st["last_emitted"] = now
+                    log.info(
+                        "job %s cell [%d] still running (%.0fs elapsed)",
+                        job_id,
+                        idx,
+                        elapsed,
+                    )
+
+            hb_thread = threading.Thread(
+                target=_heartbeat, daemon=True, name=f"nb-hb-{job.job_id}-{idx}"
+            )
+            hb_thread.start()
+            try:
+                result = exec_cell_to_disk(
+                    client,
+                    job.notebook_path,
+                    idx,
+                    timeout=timeout,
+                    on_output=_on_output,
+                    running_header=running_header,
+                    interrupt_fn=_interrupt,
+                    recover_fn=_recover,
+                )
+            finally:
+                heartbeat_stop.set()
+                hb_thread.join(timeout=1)
+
+            cp.finished_at = time.monotonic()
+            elapsed = cp.elapsed or 0.0
+            finished_ts = _now_ts()
+
+            if result["had_error"]:
+                cp.status = CellStatus.ERROR
+                cp.error_summary = _extract_error(result["outputs"])
+                log.error(
+                    "job %s cell [%d] errored after %.1fs: %s",
+                    job.job_id,
+                    idx,
+                    elapsed,
+                    cp.error_summary,
+                )
+                _append_status_line(
+                    job.notebook_path,
+                    idx,
+                    f"[nb mcp] ✗ Error at {finished_ts} · ran {elapsed:.1f}s",
+                )
+
+                for remaining_idx in job.cell_indices[pos + 1 :]:
+                    rcp = job.cells[remaining_idx]
+                    rcp.status = CellStatus.SKIPPED
+                    write_cell_status(
+                        job.notebook_path,
+                        remaining_idx,
+                        "[nb mcp] ⊘ Skipped (earlier cell errored)",
+                    )
+                log.info(
+                    "job %s halted — %d cells skipped",
+                    job.job_id,
+                    len(job.cell_indices) - pos - 1,
+                )
+
+                job.state = JobState.ERROR
+                return
+            else:
+                cp.status = CellStatus.DONE
+                log.info("job %s cell [%d] done in %.1fs", job.job_id, idx, elapsed)
+                _append_status_line(
+                    job.notebook_path,
+                    idx,
+                    f"[nb mcp] ✓ Done at {finished_ts} · ran {elapsed:.1f}s",
+                )
+
+        job.state = JobState.DONE
+        log.info("job %s complete", job.job_id)
+
+    except Exception as exc:
+        log.exception("job %s crashed: %s", job.job_id, exc)
+        job.state = JobState.ERROR
+        for cp in job.cells.values():
+            if cp.status in (CellStatus.QUEUED, CellStatus.RUNNING):
+                cp.status = CellStatus.ERROR
+                cp.error_summary = str(exc)
+    finally:
+        job.finished_at = time.time()
+        with _lock:
+            _active.pop(key, None)
+            _finished[key] = job
+
+
+def _extract_error(outputs: list) -> str:
+    for out in outputs:
+        if out.get("output_type") == "error":
+            return f"{out['ename']}: {out['evalue']}"
+    return "unknown error"
+
+
+def _append_status_line(nb_path: str, idx: int, text: str) -> None:
+    """Append an nb-mcp timing/status line to a cell's existing outputs on disk (stderr-styled)."""
+    nb = read_nb(nb_path)
+    cell = nb.cells[idx]
+    cell["outputs"].append(
+        nbformat.v4.new_output("stream", name="stderr", text=f"\n{text}")
+    )
+    atomic_write_nb(nb, nb_path)
+
+
+def get_active_job(notebook_path: str) -> Job | None:
+    key = _nb_key(notebook_path)
+    with _lock:
+        return _active.get(key)
+
+
+def list_all_active() -> list[Job]:
+    with _lock:
+        return list(_active.values())
+
+
+def list_all_finished(limit: int = 5) -> list[Job]:
+    with _lock:
+        jobs_by_time = sorted(
+            _finished.values(),
+            key=lambda j: j.finished_at or 0,
+            reverse=True,
+        )
+    return jobs_by_time[:limit]
+
+
+def get_status(notebook_path: str) -> str:
+    """Human-readable status of the active or most recent job."""
+    key = _nb_key(notebook_path)
+    with _lock:
+        job = _active.get(key) or _finished.get(key)
+
+    if job is None:
+        return "no execution history for this notebook"
+
+    total = len(job.cell_indices)
+    lines = [f"job {job.job_id}: {job.state.value} ({total} cells)"]
+
+    for idx in job.cell_indices:
+        cp = job.cells[idx]
+        elapsed_str = f" {cp.elapsed:.1f}s" if cp.elapsed is not None else ""
+        idle_str = ""
+        if cp.status == CellStatus.RUNNING:
+            if cp.idle is not None:
+                idle_str = f" (last output {cp.idle:.1f}s ago)"
+            else:
+                idle_str = " (no output yet)"
+        err_str = f" — {cp.error_summary}" if cp.error_summary else ""
+        lines.append(f"  [{idx}] {cp.status.value}{elapsed_str}{idle_str}{err_str}")
+
+    return "\n".join(lines)
+
+
+def format_global_status() -> str:
+    """Multi-section snapshot: every kernel, every active/recent job."""
+    lines: list[str] = []
+
+    # Kernels
+    kns = kernels.list_all()
+    if kns:
+        lines.append(f"Kernels ({len(kns)}):")
+        for path, alive, pid in kns:
+            alive_str = "alive" if alive else "dead"
+            pid_str = f" pid={pid}" if pid else ""
+            lines.append(f"  [{alive_str}]{pid_str}  {path}")
+    else:
+        lines.append("Kernels: none")
+
+    # Active jobs
+    active = list_all_active()
+    if active:
+        lines.append("")
+        lines.append(f"Active jobs ({len(active)}):")
+        for job in active:
+            running = sum(
+                1 for cp in job.cells.values() if cp.status == CellStatus.RUNNING
+            )
+            done = sum(1 for cp in job.cells.values() if cp.status == CellStatus.DONE)
+            total = len(job.cells)
+            age = time.time() - job.created_at
+            lines.append(
+                f"  job {job.job_id}  {job.notebook_path}  "
+                f"({done}/{total} done, {running} running, {age:.0f}s since submit)"
+            )
+    else:
+        lines.append("")
+        lines.append("Active jobs: none")
+
+    # Recent finished
+    recent = list_all_finished(limit=5)
+    if recent:
+        lines.append("")
+        lines.append("Recent jobs (last 5):")
+        for job in recent:
+            ago = time.time() - (job.finished_at or time.time())
+            lines.append(
+                f"  job {job.job_id}  {job.notebook_path}  "
+                f"{job.state.value} (finished {ago:.0f}s ago)"
+            )
+
+    return "\n".join(lines)
