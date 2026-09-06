@@ -94,7 +94,7 @@ def execute_code(
         except (TimeoutError, queue.Empty):
             # No message within the poll window — loop to check deadline.
             continue
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — any iopub read failure is recoverable below
             # Typically a ZMQ framing desync: ValueError('<IDS|MSG>' is not in list).
             # Under heavy iopub traffic one bad frame will keep firing unless we
             # rebuild channels. Kernel stays alive; we re-subscribe.

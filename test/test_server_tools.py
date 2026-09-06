@@ -31,9 +31,8 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _run_and_wait(coro, notebook_path: str, timeout: float = 30):
-    """Run an async exec tool, then wait for the background job to finish."""
-    result = asyncio.run(coro)
+def _drain(notebook_path: str, timeout: float = 30) -> None:
+    """Wait for the notebook's active job (if any) to finish."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         job = jobs.get_active_job(notebook_path)
@@ -41,7 +40,18 @@ def _run_and_wait(coro, notebook_path: str, timeout: float = 30):
             break
         if job.thread is not None:
             job.thread.join(timeout=0.5)
+
+
+def _run_and_wait(coro, notebook_path: str, timeout: float = 30):
+    """Run an async exec tool, then wait for the background job to finish."""
+    result = asyncio.run(coro)
+    _drain(notebook_path, timeout)
     return result
+
+
+def _no_grace(monkeypatch) -> None:
+    """Make exec tools hand back immediately so jobs are observably in flight."""
+    monkeypatch.setenv("NB_MCP_BLOCK_FOR_SEC", "0")
 
 
 # -- read/edit (sync, unchanged) --
@@ -154,7 +164,7 @@ def test_global_status_with_no_activity():
 def test_global_status_reports_kernel_and_recent_job(tmp_path: Path):
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "print('hi')")
-    _run_and_wait(server.exec_cell(p, index=0, block_for=0), p)
+    _run_and_wait(server.exec_cell(p, index=0), p)
     out = _run(server.status())
     # kernel from the run is still registered
     assert "Kernels (" in out
@@ -164,47 +174,86 @@ def test_global_status_reports_kernel_and_recent_job(tmp_path: Path):
     assert "done" in out
 
 
-def test_short_job_returns_inline_within_block_for(tmp_path: Path):
-    """A quick cell completes inside block_for and returns status, not a Monitor hint."""
+def test_short_job_returns_inline_within_grace(tmp_path: Path):
+    """A quick cell completes inside the default grace and returns status inline."""
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "print('hi')")
-    out = _run(server.exec_cell(p, index=0, block_for=10))
+    out = _run(server.exec_cell(p, index=0))
     assert "done" in out
     assert "uv run nb watch" not in out
     assert jobs.get_active_job(p) is None
 
 
-def test_long_job_returns_monitor_hint_after_block_for(tmp_path: Path):
-    """A cell still running after block_for seconds falls back to the Monitor hint."""
+def test_long_job_hands_back_after_grace(tmp_path: Path, monkeypatch):
+    """A cell still running after the grace period returns the follow-up hints."""
+    monkeypatch.setenv("NB_MCP_BLOCK_FOR_SEC", "1")
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "import time; time.sleep(3)")
-    out = _run(server.exec_cell(p, index=0, timeout=30, block_for=1))
-    assert "uv run nb watch" in out
-    assert "--job" in out
-    # Drain the active job so fixtures can clean up.
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        job = jobs.get_active_job(p)
-        if job is None:
-            break
-        if job.thread is not None:
-            job.thread.join(timeout=0.5)
+    t0 = time.monotonic()
+    out = _run(server.exec_cell(p, index=0, timeout=30))
+    assert time.monotonic() - t0 < 2.5, "tool call must not wait for the cell"
+    assert "Still running after 1s" in out
+    assert "exec_status" in out
+    assert "uv run nb watch" in out and "--job" in out
+    _drain(p)
 
 
-def test_block_for_zero_never_blocks(tmp_path: Path):
-    """block_for=0 should skip the join and always return the Monitor hint."""
+def test_zero_grace_never_blocks(tmp_path: Path, monkeypatch):
+    """NB_MCP_BLOCK_FOR_SEC=0 skips the join and always hands back immediately."""
+    _no_grace(monkeypatch)
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "print('instant')")
-    out = _run(server.exec_cell(p, index=0, block_for=0))
+    out = _run(server.exec_cell(p, index=0))
     assert "uv run nb watch" in out
-    # Drain.
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        job = jobs.get_active_job(p)
-        if job is None:
-            break
-        if job.thread is not None:
-            job.thread.join(timeout=0.5)
+    _drain(p, timeout=10)
+
+
+def test_grace_is_not_a_tool_argument():
+    """Agents used to pass block_for=300 and wedge the tool slot — the knob is gone."""
+    tools = {t.name: t for t in server.mcp._tool_manager.list_tools()}
+    for name in (
+        "exec_cell",
+        "exec_range",
+        "exec_all",
+        "insert_and_exec",
+        "run_scratch",
+    ):
+        assert "block_for" not in tools[name].parameters["properties"], name
+
+
+# -- scratch runs go through the job slot too --
+
+
+def test_run_scratch_long_goes_async_then_status_has_output(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("NB_MCP_BLOCK_FOR_SEC", "1")
+    p = _nb(tmp_path)
+    out = _run(server.run_scratch(p, "import time; time.sleep(2); print('late')"))
+    assert "Still running after 1s" in out
+    assert "late" not in out
+    _drain(p)
+    status = _run(server.exec_status(p))
+    assert "done (scratch)" in status
+    assert "-> late" in status
+
+
+def test_run_scratch_error_is_reported_inline(tmp_path: Path):
+    p = _nb(tmp_path)
+    out = _run(server.run_scratch(p, "1/0"))
+    assert "error (scratch)" in out
+    assert "ZeroDivisionError" in out
+
+
+def test_run_scratch_conflicts_with_running_job(tmp_path: Path, monkeypatch):
+    """Two readers on one iopub channel steal each other's messages — refuse instead."""
+    _no_grace(monkeypatch)
+    p = _nb(tmp_path)
+    server.insert_cell(p, 0, "import time; time.sleep(2)")
+    _run(server.exec_cell(p, index=0))
+    out = _run(server.run_scratch(p, "1 + 1"))
+    assert "already has a running job" in out
+    _drain(p)
 
 
 def test_timeout_is_wall_clock_not_idle_gap(tmp_path: Path):
@@ -258,7 +307,7 @@ def test_progress_lines_written_to_log(tmp_path: Path, monkeypatch):
         0,
         "import time\nfor i in range(20):\n    print(f'step {i}', flush=True)\n    time.sleep(0.1)",
     )
-    _run_and_wait(server.exec_cell(p, index=0, timeout=30, block_for=0), p)
+    _run_and_wait(server.exec_cell(p, index=0, timeout=30), p)
 
     body = log_path.read_text()
     progress_lines = [line for line in body.splitlines() if " out: step " in line]
@@ -293,7 +342,7 @@ def test_heartbeat_for_silent_cell(tmp_path: Path, monkeypatch):
 
     p = _nb(tmp_path, "silent.ipynb")
     server.insert_cell(p, 0, "import time; time.sleep(1.2)")
-    _run_and_wait(server.exec_cell(p, index=0, timeout=30, block_for=0), p)
+    _run_and_wait(server.exec_cell(p, index=0, timeout=30), p)
 
     body = log_path.read_text()
     heartbeats = [line for line in body.splitlines() if "still running" in line]
@@ -320,20 +369,13 @@ def test_exec_cell_without_id_streams_output(tmp_path: Path):
     assert "[nb mcp] ✓ Done" in body
 
 
-def test_exec_conflict(tmp_path: Path):
+def test_exec_conflict(tmp_path: Path, monkeypatch):
+    _no_grace(monkeypatch)  # so exec_all returns while its job is still running
     p = _nb(tmp_path)
     server.insert_cell(p, 0, "import time; time.sleep(2)")
     server.insert_cell(p, 1, "print('done')")
-    # block_for=0 so this returns while the first job is still running.
-    _run(server.exec_all(p, block_for=0))
+    _run(server.exec_all(p))
     # second exec on same notebook should report conflict
-    result = _run(server.exec_cell(p, index=0, block_for=0))
+    result = _run(server.exec_cell(p, index=0))
     assert "already has a running job" in result
-    # wait for the first job to finish
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        job = jobs.get_active_job(p)
-        if job is None:
-            break
-        if job.thread is not None:
-            job.thread.join(timeout=0.5)
+    _drain(p)

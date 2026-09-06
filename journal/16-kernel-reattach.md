@@ -86,6 +86,7 @@ def get_or_start(path):
             _drop_persisted(k)
     # 3. start new (unchanged); write persisted if enabled
 
+
 def _ensure_shutdown_hooks():
     if _persist_enabled():
         atexit.register(_detach_all)  # stop_channels only, kernels live on

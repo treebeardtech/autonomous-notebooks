@@ -1,19 +1,21 @@
 """Stdio MCP server exposing notebook tools.
 
 Read/edit tools are kernel-free — they operate on `.ipynb` files directly.
-Exec tools fire background jobs that run on per-notebook threads. Kernels
-live in-process and die with the server when Claude Code exits.
+Exec tools fire background jobs that run on per-notebook threads and hand
+back within a short grace period. Kernels live in-process and die with the
+server when Claude Code exits.
 """
 
+import os
+
 import anyio
-from mcp.server.fastmcp import FastMCP
 
 from autonomous_notebooks import jobs, kernels, nb_io
 from autonomous_notebooks._log import get_logger
-from autonomous_notebooks.exec_runner import execute_code
+from autonomous_notebooks._mcp_compat import Server
 
 log = get_logger()
-mcp = FastMCP("autonomous-notebooks")
+mcp = Server("autonomous-notebooks")
 
 
 def _monitor_hint(job_id: str, notebook_path: str) -> str:
@@ -25,17 +27,51 @@ def _monitor_hint(job_id: str, notebook_path: str) -> str:
     )
 
 
-def _exec_response(
-    notebook_path: str, job: jobs.Job, block_for: int, headline: str
-) -> str:
-    """Block briefly for the job to finish — if it does, return status inline.
-    Otherwise return the headline + Monitor hint so the agent can stream.
+def _grace_period() -> float:
+    """Seconds an exec tool waits for the job before handing it back as async.
+
+    Fixed server-side (`NB_MCP_BLOCK_FOR_SEC`, default 5) rather than a tool
+    argument: when agents could pick it they picked minutes, which held the
+    tool slot, hit Claude Code's 120s auto-background, and invited the
+    user-cancel that used to drop the whole connection (journal 17).
     """
-    if block_for > 0 and job.thread is not None:
-        job.thread.join(timeout=block_for)
+    raw = os.environ.get("NB_MCP_BLOCK_FOR_SEC")
+    if raw is None:
+        return 5.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
+def _exec_response(notebook_path: str, job: jobs.Job, headline: str) -> str:
+    """Wait out the grace period — if the job finishes, return status inline.
+    Otherwise return the headline + how to follow the job in the background.
+    """
+    grace = _grace_period()
+    if grace > 0 and job.thread is not None:
+        job.thread.join(timeout=grace)
     if jobs.get_active_job(notebook_path) is None:
         return f"{headline}\n\n{jobs.get_status(notebook_path)}"
-    return f"{headline}\n\n{_monitor_hint(job.job_id, notebook_path)}"
+    return (
+        f"{headline}\n\n"
+        f"Still running after {grace:g}s — continuing in the background.\n"
+        f"Poll with exec_status(notebook_path) or stream events:\n"
+        f"{_monitor_hint(job.job_id, notebook_path)}"
+    )
+
+
+async def _submit_and_respond(
+    notebook_path: str, cell_indices: list[int], timeout: int, headline: str
+) -> str:
+    try:
+        job = jobs.submit_execution(notebook_path, cell_indices, timeout=timeout)
+    except RuntimeError as exc:
+        return str(exc)
+    full_headline = f"{headline} (job {job.job_id})\n{notebook_path}"
+    return await anyio.to_thread.run_sync(
+        lambda: _exec_response(notebook_path, job, full_headline)
+    )
 
 
 # -- read --
@@ -135,26 +171,20 @@ async def exec_cell(
     index: int | None = None,
     cell_id: str | None = None,
     timeout: int = 120,
-    block_for: int = 10,
 ) -> str:
     """Execute one cell on the notebook's kernel (auto-started). Outputs written to disk.
 
-    Waits up to `block_for` seconds for the job to finish so short cells
-    return inline. Longer ones return a Monitor-ready command to stream
-    progress without blocking the tool slot.
+    Returns inline if the cell finishes within a few seconds; otherwise the
+    job keeps running in the background — follow it with exec_status or the
+    Monitor command in the response. `timeout` is the cell's wall-clock limit.
     """
     nb_io.ensure_notebook(notebook_path)
     nb = nb_io.read_nb(notebook_path)
     idx = nb_io.resolve_index(nb, index=index, cell_id=cell_id)
     if nb.cells[idx]["cell_type"] != "code":
         return f"cell {idx} is {nb.cells[idx]['cell_type']}, not code"
-    try:
-        job = jobs.submit_execution(notebook_path, [idx], timeout=timeout)
-    except RuntimeError as exc:
-        return str(exc)
-    headline = f"executing cell {idx} (job {job.job_id})\n{notebook_path}"
-    return await anyio.to_thread.run_sync(
-        lambda: _exec_response(notebook_path, job, block_for, headline)
+    return await _submit_and_respond(
+        notebook_path, [idx], timeout, f"executing cell {idx}"
     )
 
 
@@ -164,11 +194,11 @@ async def exec_range(
     start: int,
     end: int,
     timeout: int = 120,
-    block_for: int = 10,
 ) -> str:
     """Execute cells [start, end) in order. Stops on first error.
 
-    Blocks up to `block_for` seconds so short jobs return inline.
+    Returns inline if done within a few seconds, else runs in the background
+    (see exec_cell). `timeout` applies per cell.
     """
     nb_io.ensure_notebook(notebook_path)
     nb = nb_io.read_nb(notebook_path)
@@ -182,23 +212,17 @@ async def exec_range(
     if not code_indices:
         return f"no code cells in range {start}:{end}"
 
-    try:
-        job = jobs.submit_execution(notebook_path, code_indices, timeout=timeout)
-    except RuntimeError as exc:
-        return str(exc)
-    headline = (
-        f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}"
-    )
-    return await anyio.to_thread.run_sync(
-        lambda: _exec_response(notebook_path, job, block_for, headline)
+    return await _submit_and_respond(
+        notebook_path, code_indices, timeout, f"executing {len(code_indices)} cells"
     )
 
 
 @mcp.tool()
-async def exec_all(notebook_path: str, timeout: int = 120, block_for: int = 10) -> str:
+async def exec_all(notebook_path: str, timeout: int = 120) -> str:
     """Execute every code cell in order. Stops on first error.
 
-    Blocks up to `block_for` seconds so short notebooks return inline.
+    Returns inline if done within a few seconds, else runs in the background
+    (see exec_cell). `timeout` applies per cell.
     """
     nb_io.ensure_notebook(notebook_path)
     nb = nb_io.read_nb(notebook_path)
@@ -206,35 +230,28 @@ async def exec_all(notebook_path: str, timeout: int = 120, block_for: int = 10) 
     if not code_indices:
         return "no code cells to execute"
 
-    try:
-        job = jobs.submit_execution(notebook_path, code_indices, timeout=timeout)
-    except RuntimeError as exc:
-        return str(exc)
-    headline = (
-        f"executing {len(code_indices)} cells (job {job.job_id})\n{notebook_path}"
-    )
-    return await anyio.to_thread.run_sync(
-        lambda: _exec_response(notebook_path, job, block_for, headline)
+    return await _submit_and_respond(
+        notebook_path, code_indices, timeout, f"executing {len(code_indices)} cells"
     )
 
 
 @mcp.tool()
 async def run_scratch(notebook_path: str, code: str, timeout: int = 120) -> str:
-    """Execute `code` on the notebook's kernel without writing it back to the file."""
+    """Execute `code` on the notebook's kernel without writing it back to the file.
+
+    Output is returned inline when it finishes within a few seconds; otherwise
+    the run continues in the background and exec_status shows the output once
+    it completes. Shares the notebook's one-job-at-a-time slot with exec_*.
+    """
     nb_io.ensure_notebook(notebook_path)
-
-    def _run() -> str:
-        client = kernels.get_or_start(notebook_path)
-        outputs = execute_code(
-            client,
-            code,
-            timeout=timeout,
-            interrupt_fn=lambda: kernels.interrupt(notebook_path),
-            recover_fn=lambda: kernels.reset_client(notebook_path),
-        )
-        return nb_io.fmt_outputs(outputs, indent="") or "(no output)"
-
-    return await anyio.to_thread.run_sync(_run)
+    try:
+        job = jobs.submit_scratch(notebook_path, code, timeout=timeout)
+    except RuntimeError as exc:
+        return str(exc)
+    headline = f"running scratch code (job {job.job_id})\n{notebook_path}"
+    return await anyio.to_thread.run_sync(
+        lambda: _exec_response(notebook_path, job, headline)
+    )
 
 
 @mcp.tool()
@@ -243,11 +260,11 @@ async def insert_and_exec(
     index: int,
     source: str,
     timeout: int = 120,
-    block_for: int = 10,
 ) -> str:
     """Insert a code cell then execute it. Common enough to be a single tool call.
 
-    Blocks up to `block_for` seconds so short cells return inline.
+    Returns inline if done within a few seconds, else runs in the background
+    (see exec_cell).
     """
     nb_io.ensure_notebook(notebook_path)
     nb = nb_io.read_nb(notebook_path)
@@ -260,13 +277,14 @@ async def insert_and_exec(
         return f"cell inserted at {idx} but execution failed: {exc}"
     headline = f"inserted and executing cell {idx} (job {job.job_id})\n{notebook_path}"
     return await anyio.to_thread.run_sync(
-        lambda: _exec_response(notebook_path, job, block_for, headline)
+        lambda: _exec_response(notebook_path, job, headline)
     )
 
 
 @mcp.tool()
 async def exec_status(notebook_path: str) -> str:
-    """Check execution progress for a notebook. Shows active or most recent job."""
+    """Check execution progress for a notebook. Shows the active or most recent job
+    (including a finished scratch run's output)."""
     nb_io.ensure_notebook(notebook_path)
     return jobs.get_status(notebook_path)
 

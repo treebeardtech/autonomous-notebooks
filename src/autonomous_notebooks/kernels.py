@@ -41,7 +41,11 @@ def get_or_start(path: str) -> BlockingKernelClient:
 
     log.info("starting kernel for %s", k)
     km = KernelManager()
-    km.start_kernel()
+    # jupyter_client lets the kernel inherit our stdout, which under `nb mcp`
+    # is the JSON-RPC stream to Claude Code. Anything the kernel writes to
+    # raw fd 1 before ipykernel captures it would corrupt the protocol, so
+    # point it at our stderr (surfaced by Claude Code as "Server stderr").
+    km.start_kernel(stdout=sys.stderr.fileno(), stderr=sys.stderr.fileno())
     client = km.client()
     client.start_channels()
     client.wait_for_ready(timeout=30)
@@ -54,7 +58,7 @@ def get_or_start(path: str) -> BlockingKernelClient:
                 client.stop_channels()
                 km.shutdown_kernel(now=True)
             except Exception:
-                pass
+                log.debug("discarding duplicate kernel raised", exc_info=True)
             return race[1]
         _kernels[k] = (km, client)
     log.info("kernel ready for %s", k)
@@ -161,7 +165,7 @@ def list_all() -> list[tuple[str, bool, int | None]]:
         try:
             if km.provisioner is not None:
                 pid = km.provisioner.pid  # type: ignore[attr-defined]
-        except Exception:
+        except Exception:  # noqa: BLE001 — pid is best-effort display only
             pid = None
         out.append((path, km.is_alive(), pid))
     return out

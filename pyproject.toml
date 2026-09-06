@@ -1,14 +1,15 @@
 [project]
 name = "autonomous-notebooks"
-version = "0.2.0"
+version = "0.3.0"
 description = "Stdio MCP server for agents to read, edit, and execute Jupyter notebooks headlessly"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ipykernel>=7.2.0",
-    "jupyter-client>=8.8.0",
-    "mcp[cli]>=1.2.0",
-    "nbformat>=5.10.4",
+    "ipykernel>=7.3.0",
+    "jupyter-client>=8.10.0",
+    # 1.27 is the last 1.x and the floor the cancel shim in _mcp_compat targets.
+    "mcp[cli]>=1.27.0",
+    "nbformat>=5.11.1",
 ]
 
 [project.scripts]
@@ -22,9 +23,9 @@ build-backend = "hatchling.build"
 dev = [
     "jupyter>=1.1.1",
     "nbstripout>=0.9.0",
-    "pyright>=1.1.408",
-    "pytest>=9.0.2",
-    "ruff>=0.15.0",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
 ]
 
 [tool.hatch.build.targets.wheel]

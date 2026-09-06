@@ -18,9 +18,10 @@ A stdio MCP server that lets an agent read, modify, and execute Jupyter notebook
 ## 2. Architecture
 
 ```
-Claude Code  ──stdio──>  nb MCP server (FastMCP)
+Claude Code  ──stdio──>  nb MCP server (mcp MCPServer, 1.x FastMCP via _mcp_compat)
                           ├─ nb_io         (pure nbformat read/write)
                           ├─ exec_runner   (streaming code execution)
+                          ├─ jobs          (one background job per notebook)
                           └─ kernels       ({notebook_path → ipykernel})
 ```
 
@@ -46,20 +47,29 @@ All tools take `notebook_path: str` as their first argument.
 - `clear_outputs(notebook_path, index?)`
 
 **Exec (auto-starts kernel)**
-- `exec_cell(notebook_path, index?, cell_id?, timeout=120, block_for=10)`
-- `exec_range(notebook_path, start, end, timeout=120, block_for=10)`
-- `exec_all(notebook_path, timeout=120, block_for=10)`
-- `run_scratch(notebook_path, code, timeout=120)` — ephemeral
-- `insert_and_exec(notebook_path, index, source, timeout=120, block_for=10)`
+- `exec_cell(notebook_path, index?, cell_id?, timeout=120)`
+- `exec_range(notebook_path, start, end, timeout=120)`
+- `exec_all(notebook_path, timeout=120)`
+- `run_scratch(notebook_path, code, timeout=120)` — ephemeral, output kept in memory
+- `insert_and_exec(notebook_path, index, source, timeout=120)`
 - `exec_status(notebook_path)` — snapshot of the active or most recent job
+  (for a finished scratch run, includes its output)
 - `status()` — **global** snapshot: every kernel + every active/recent job (no path arg)
 
-The non-scratch exec tools block for up to `block_for` seconds (default
-10). If the job finishes in time, the response is the full status inline.
-Otherwise the response is a ready-to-use Monitor command, e.g.
-`Monitor(command='uv run nb watch --job abc123 --path nb.ipynb')`. The
-agent pairs that with Claude Code's Monitor tool to stream progress
-without blocking the conversation. Set `block_for=0` for fire-and-forget.
+Every exec tool (scratch included) is a background job. The tool waits a
+fixed grace period — `NB_MCP_BLOCK_FOR_SEC`, default 5s — and if the job
+finishes in time returns its status inline. Otherwise it hands back
+immediately with two ways to follow along: poll `exec_status`, or run the
+ready-made Monitor command, e.g.
+`Monitor(command='uv run nb watch --job abc123 --path nb.ipynb')`.
+The grace is deliberately **not** a tool argument: given the knob, agents
+asked for minutes, which held the tool slot, tripped Claude Code's 120s
+auto-background, and invited the user-cancel that dropped the connection
+(journal 17). `timeout` is the wall-clock limit per cell, not a wait.
+
+One job per notebook at a time — a second exec or scratch on the same
+notebook is refused until the first finishes (two readers on one kernel's
+iopub channel would steal each other's output).
 
 **Kernel lifecycle**
 - `interrupt(notebook_path)`
@@ -79,8 +89,9 @@ nb cleanup                          # kill stray ipykernel processes and delete 
 nb status                           # summarise recent jobs from the log + live
                                     # ipykernel processes. For the running MCP's
                                     # in-memory state, use the `status` MCP tool.
-nb watch --job <id> [--path <nb>]   # tail .nb_mcp.log for one job, exit when done.
-                                    # emit one line per event — designed for Monitor.
+nb watch --job <id> [--path <nb>]   # tail .nb_mcp.log for one job, exit when it ends
+                                    # (complete / halted / crashed). One line per event —
+                                    # designed for Monitor.
 ```
 
 ## 4a. Logging
