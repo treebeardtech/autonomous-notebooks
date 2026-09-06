@@ -17,12 +17,15 @@ except ImportError:  # mcp 1.x
     )
 
     async def _cancel_without_response(self: RequestResponder) -> None:
-        # Upstream 1.x: cancel the scope, mark completed, then send an error
-        # response. Everything but the response.
+        # Upstream 1.x cancels the scope, marks the request completed, and
+        # sends an error response. We only cancel the scope: `respond()` then
+        # sees `cancelled` and sends nothing. Not marking it completed matters —
+        # our handlers wait on a shielded worker thread, so they return
+        # normally after the cancel, and upstream's `respond()` would trip
+        # `assert not self._completed` and take the whole server down.
         if not self._cancel_scope:  # pragma: no cover
             raise RuntimeError("No active cancel scope")
         self._cancel_scope.cancel()
-        self._completed = True
 
     RequestResponder.cancel = _cancel_without_response
 

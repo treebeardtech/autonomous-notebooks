@@ -38,12 +38,25 @@ One host, 76 Claude Code transcripts, 2204 `nb` tool calls.
   for every notebook at that second. All in-memory state gone; the user
   ran `/mcp` or restarted.
 
+  The teardown is the server dying, not Claude Code killing it. Our
+  handler is parked on a *shielded* worker-thread join, so the cancel
+  doesn't interrupt it; it returns normally when the join ends, and
+  `_handle_request` calls `respond()`, which trips
+  `assert not self._completed` ("Request already responded to") because
+  `cancel()` already marked it done. AssertionError in the task group →
+  process exits → atexit stops every kernel. Reproduced on the old code
+  with the probe below: error reply at the cancel, exit code 1 with that
+  assertion when the join ended. The field timeline matches: job
+  complete 13:24:10, seven `kernel stopped` lines 13:24:13, next tool
+  call `Connection closed`.
+
 - Ten "Connection failed" entries were a different, boring thing: `uv
   run nb mcp` with `nb` not installed in that project's venv
   (`Failed to spawn: nb`).
 
 Reproduced with a raw JSON-RPC probe against the old server: cancel a
-blocking `insert_and_exec`, receive `{"id":2,"error":{"code":0,...}}`.
+blocking `insert_and_exec`, receive `{"id":2,"error":{"code":0,...}}`,
+then watch the process die once the blocking window ends.
 
 ## What changed
 
@@ -59,7 +72,8 @@ blocking `insert_and_exec`, receive `{"id":2,"error":{"code":0,...}}`.
 - mcp `>=1.27`, resolved to 2.x here (`FastMCP` → `MCPServer`, sync
   tools now run on worker threads). `_mcp_compat.py` handles 1.x —
   needed because `claude-agent-sdk` still pins `mcp<2` — and patches
-  `cancel()` to stop answering cancelled requests.
+  `cancel()` to only cancel the scope: no reply, and no `_completed`
+  flag for `respond()` to trip over when the handler returns.
 - `nb watch` exits on `halted` too. Previously an errored cell left the
   Monitor tailing forever.
 - Kernel subprocesses no longer inherit the server's stdout (the RPC
