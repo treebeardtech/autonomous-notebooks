@@ -61,20 +61,27 @@ All tools take `notebook_path` (absolute or relative, created if missing).
 | `delete_cell(index?, cell_id?)` | Delete a cell. |
 | `clear_outputs(index?)` | Clear outputs from one cell or all code cells. |
 | `exec_cell(index?, cell_id?)` | Execute a cell; outputs written back to the file. |
+| `exec_status` | Progress of the notebook's active or latest job (incl. scratch output). |
 | `exec_range(start, end)` | Execute cells `[start, end)`; stops on first error. |
 | `exec_all` | Execute every code cell in order; stops on first error. |
-| `run_scratch(code)` | Execute arbitrary code without writing it to the notebook. |
+| `run_scratch(code)` | Execute arbitrary code without writing it to the notebook; output returned inline or via `exec_status`. |
 | `insert_and_exec(index, source)` | Insert a code cell and execute it in one step. |
 | `interrupt` | Send SIGINT to the notebook's kernel. |
 | `shutdown_kernel` | Stop the notebook's kernel. Next exec starts a fresh one. |
 
+Execution never holds the agent hostage: every exec tool waits at most a
+short grace period (`NB_MCP_BLOCK_FOR_SEC`, default 5s) for the job to finish.
+Short cells come back inline; longer ones keep running in the background and
+the response tells the agent how to follow them — `exec_status`, or the
+ready-made `Monitor(command='uv run nb watch --job …')` line.
+
 ## Admin CLI
 
-Only two subcommands. Everything else is MCP tools.
-
 ```bash
-nb mcp       # run the stdio MCP server (Claude Code invokes this)
-nb cleanup   # kill stray ipykernel processes and remove leftover .nb/
+nb mcp                 # run the stdio MCP server (Claude Code invokes this)
+nb cleanup             # kill stray ipykernel processes and remove leftover .nb/
+nb status              # recent jobs from the log + live ipykernel processes
+nb watch --job <id>    # tail the log for one job; exits when it ends (for Monitor)
 ```
 
 ## Contributing

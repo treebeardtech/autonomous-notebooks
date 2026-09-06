@@ -83,14 +83,9 @@ def test_watch_prints_matching_events_and_exits(tmp_path: Path) -> None:
 def test_status_reports_jobs_from_log(tmp_path: Path) -> None:
     log = tmp_path / "nb_mcp.log"
     log.write_text(
-        "\n".join(
-            [
-                "2026-04-22 10:00:00+0000 INFO    nb_mcp: job aaa submitted: a.ipynb (1 cells: [0])",
-                "2026-04-22 10:00:01+0000 INFO    nb_mcp: job aaa complete",
-                "2026-04-22 10:00:02+0000 INFO    nb_mcp: job bbb submitted: b.ipynb (2 cells: [0, 1])",
-            ]
-        )
-        + "\n"
+        "2026-04-22 10:00:00+0000 INFO    nb_mcp: job aaa submitted: a.ipynb (1 cells: [0])\n"
+        "2026-04-22 10:00:01+0000 INFO    nb_mcp: job aaa complete\n"
+        "2026-04-22 10:00:02+0000 INFO    nb_mcp: job bbb submitted: b.ipynb (2 cells: [0, 1])\n"
     )
 
     proc = subprocess.run(
@@ -102,6 +97,7 @@ def test_status_reports_jobs_from_log(tmp_path: Path) -> None:
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "PYTHONPATH": str(Path(__file__).parent.parent / "src"),
         },
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     assert "Active jobs (from log) (1)" in proc.stdout
@@ -137,3 +133,49 @@ def test_watch_times_out_if_no_matching_job(tmp_path: Path) -> None:
     _, stderr = proc.communicate(timeout=10)
     assert proc.returncode == 3
     assert "no matching job" in stderr
+
+
+def test_watch_exits_when_job_halts_on_error(tmp_path: Path) -> None:
+    """A cell error ends the job with "halted", not "complete" — watch must still exit."""
+    log = tmp_path / "nb_mcp.log"
+    log.write_text("")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "autonomous_notebooks.cli",
+            "watch",
+            "--job",
+            "def456",
+            "--startup-timeout",
+            "10",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            "NB_MCP_LOG_PATH": str(log),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PYTHONPATH": str(Path(__file__).parent.parent / "src"),
+        },
+        text=True,
+    )
+
+    def writer() -> None:
+        time.sleep(0.5)
+        _append(
+            log,
+            "2026-04-22 11:00:00+0000 INFO    nb_mcp: job def456 submitted: nbs/foo.ipynb (2 cells: [0, 1])",
+        )
+        _append(
+            log,
+            "2026-04-22 11:00:01+0000 ERROR   nb_mcp: job def456 cell [0] errored after 0.1s: ValueError: boom",
+        )
+        _append(
+            log,
+            "2026-04-22 11:00:01+0000 INFO    nb_mcp: job def456 halted — 1 cells skipped",
+        )
+
+    threading.Thread(target=writer, daemon=True).start()
+    out, _err = proc.communicate(timeout=20)
+    assert proc.returncode == 0, out
+    assert "halted" in out

@@ -1,4 +1,8 @@
-"""Background execution jobs. One active job per notebook, backed by a daemon thread."""
+"""Background execution jobs. One active job per notebook, backed by a daemon thread.
+
+Cell jobs stream outputs into the notebook file; scratch jobs keep theirs in
+memory on the `Job` so `exec_status` can hand them back once finished.
+"""
 
 import enum
 import os
@@ -14,11 +18,13 @@ from autonomous_notebooks import kernels
 from autonomous_notebooks._log import get_logger
 from autonomous_notebooks.exec_runner import (
     exec_cell_to_disk,
+    execute_code,
     mark_cells_status,
     write_cell_status,
 )
 from autonomous_notebooks.nb_io import (
     atomic_write_nb,
+    fmt_outputs,
     read_nb,
 )
 
@@ -73,6 +79,14 @@ class Job:
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     thread: threading.Thread | None = field(default=None, repr=False)
+    # Scratch runs only: the code and (once finished) its outputs. Cell jobs
+    # leave both empty — their outputs live in the notebook file.
+    scratch_code: str | None = None
+    scratch_outputs: list = field(default_factory=list)
+
+    @property
+    def is_scratch(self) -> bool:
+        return self.scratch_code is not None
 
 
 _lock = threading.Lock()
@@ -117,14 +131,11 @@ def _nb_key(path: str) -> str:
     return str(Path(path).resolve())
 
 
-def submit_execution(
-    notebook_path: str,
-    cell_indices: list[int],
-    timeout: int = 120,
-) -> Job:
-    """Start a background execution job. Returns immediately."""
+def _register(
+    notebook_path: str, cell_indices: list[int], scratch_code: str | None
+) -> tuple[Job, str]:
+    """Claim the notebook's single job slot. Raises RuntimeError if taken."""
     key = _nb_key(notebook_path)
-
     with _lock:
         existing = _active.get(key)
         if existing is not None:
@@ -132,15 +143,35 @@ def submit_execution(
                 f"notebook already has a running job ({existing.job_id}). "
                 "Wait for it to finish, check exec_status, or interrupt the kernel."
             )
-
         job = Job(
             job_id=uuid.uuid4().hex[:8],
             notebook_path=notebook_path,
             cell_indices=list(cell_indices),
             cells={idx: CellProgress(index=idx) for idx in cell_indices},
+            scratch_code=scratch_code,
         )
         _active[key] = job
+    return job, key
 
+
+def _start_thread(job: Job, target, key: str, timeout: int) -> None:
+    t = threading.Thread(
+        target=target,
+        args=(job, key, timeout),
+        daemon=True,
+        name=f"nb-exec-{job.job_id}",
+    )
+    job.thread = t
+    t.start()
+
+
+def submit_execution(
+    notebook_path: str,
+    cell_indices: list[int],
+    timeout: int = 120,
+) -> Job:
+    """Start a background execution job. Returns immediately."""
+    job, key = _register(notebook_path, cell_indices, scratch_code=None)
     mark_cells_status(notebook_path, cell_indices, f"[nb mcp] ⏳ Queued at {_now_ts()}")
     log.info(
         "job %s submitted: %s (%d cells: %s)",
@@ -149,16 +180,51 @@ def submit_execution(
         len(cell_indices),
         cell_indices,
     )
-
-    t = threading.Thread(
-        target=_run_job,
-        args=(job, key, timeout),
-        daemon=True,
-        name=f"nb-exec-{job.job_id}",
-    )
-    job.thread = t
-    t.start()
+    _start_thread(job, _run_job, key, timeout)
     return job
+
+
+def submit_scratch(notebook_path: str, code: str, timeout: int = 120) -> Job:
+    """Run `code` on the notebook's kernel as a background job (nothing written to disk)."""
+    job, key = _register(notebook_path, [], scratch_code=code)
+    log.info("job %s submitted: %s (scratch)", job.job_id, notebook_path)
+    _start_thread(job, _run_scratch_job, key, timeout)
+    return job
+
+
+def _run_scratch_job(job: Job, key: str, timeout: int) -> None:
+    """Worker thread: execute scratch code, keep outputs on the job."""
+    started = time.monotonic()
+    try:
+        client = kernels.get_or_start(job.notebook_path)
+        job.scratch_outputs = execute_code(
+            client,
+            job.scratch_code or "",
+            timeout=timeout,
+            interrupt_fn=lambda: kernels.interrupt(job.notebook_path),
+            recover_fn=lambda: kernels.reset_client(job.notebook_path),
+        )
+        had_error = any(o.get("output_type") == "error" for o in job.scratch_outputs)
+        job.state = JobState.ERROR if had_error else JobState.DONE
+        # "complete" is what `nb watch` keys its exit on, error or not.
+        log.info(
+            "job %s complete: scratch %s in %.1fs",
+            job.job_id,
+            job.state.value,
+            time.monotonic() - started,
+        )
+    except Exception:
+        log.exception("job %s crashed", job.job_id)
+        job.state = JobState.ERROR
+    finally:
+        _finish(job, key)
+
+
+def _finish(job: Job, key: str) -> None:
+    job.finished_at = time.time()
+    with _lock:
+        _active.pop(key, None)
+        _finished[key] = job
 
 
 def _run_job(job: Job, key: str, timeout: int) -> None:
@@ -316,17 +382,14 @@ def _run_job(job: Job, key: str, timeout: int) -> None:
         log.info("job %s complete", job.job_id)
 
     except Exception as exc:
-        log.exception("job %s crashed: %s", job.job_id, exc)
+        log.exception("job %s crashed", job.job_id)
         job.state = JobState.ERROR
         for cp in job.cells.values():
             if cp.status in (CellStatus.QUEUED, CellStatus.RUNNING):
                 cp.status = CellStatus.ERROR
                 cp.error_summary = str(exc)
     finally:
-        job.finished_at = time.time()
-        with _lock:
-            _active.pop(key, None)
-            _finished[key] = job
+        _finish(job, key)
 
 
 def _extract_error(outputs: list) -> str:
@@ -375,6 +438,8 @@ def get_status(notebook_path: str) -> str:
 
     if job is None:
         return "no execution history for this notebook"
+    if job.is_scratch:
+        return _scratch_status(job)
 
     total = len(job.cell_indices)
     lines = [f"job {job.job_id}: {job.state.value} ({total} cells)"]
@@ -392,6 +457,13 @@ def get_status(notebook_path: str) -> str:
         lines.append(f"  [{idx}] {cp.status.value}{elapsed_str}{idle_str}{err_str}")
 
     return "\n".join(lines)
+
+
+def _scratch_status(job: Job) -> str:
+    head = f"job {job.job_id}: {job.state.value} (scratch)"
+    if job.state == JobState.RUNNING:
+        return f"{head} — {time.time() - job.created_at:.1f}s elapsed"
+    return f"{head}\n{fmt_outputs(job.scratch_outputs, indent='  ') or '  (no output)'}"
 
 
 def format_global_status() -> str:
@@ -415,12 +487,18 @@ def format_global_status() -> str:
         lines.append("")
         lines.append(f"Active jobs ({len(active)}):")
         for job in active:
+            age = time.time() - job.created_at
+            if job.is_scratch:
+                lines.append(
+                    f"  job {job.job_id}  {job.notebook_path}  "
+                    f"(scratch, {age:.0f}s since submit)"
+                )
+                continue
             running = sum(
                 1 for cp in job.cells.values() if cp.status == CellStatus.RUNNING
             )
             done = sum(1 for cp in job.cells.values() if cp.status == CellStatus.DONE)
             total = len(job.cells)
-            age = time.time() - job.created_at
             lines.append(
                 f"  job {job.job_id}  {job.notebook_path}  "
                 f"({done}/{total} done, {running} running, {age:.0f}s since submit)"

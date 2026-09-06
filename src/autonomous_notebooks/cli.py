@@ -48,7 +48,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     jobs: dict[str, dict] = {}
     order: list[str] = []
     submit_re = re.compile(r"job (\w+) submitted: (\S+)")
-    finish_re = re.compile(r"job (\w+) (complete|crashed)")
+    finish_re = re.compile(r"job (\w+) (complete|halted|crashed)")
 
     for line in log_path.read_text().splitlines():
         m = submit_re.search(line)
@@ -61,7 +61,9 @@ def cmd_status(args: argparse.Namespace) -> None:
         if m:
             jid = m.group(1)
             if jid in jobs:
-                jobs[jid]["state"] = "done" if m.group(2) == "complete" else "crashed"
+                jobs[jid]["state"] = {"complete": "done", "halted": "error"}.get(
+                    m.group(2), "crashed"
+                )
                 jobs[jid]["line"] = line
 
     running = [jid for jid in order if jobs[jid]["state"] == "running"]
@@ -88,6 +90,7 @@ def _list_ipykernels() -> list[int]:
             ["pgrep", "-u", str(os.getuid()), "-f", "ipykernel_launcher"],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         return []
@@ -158,7 +161,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
         seen_job_start = True
         print(event)
 
-        if " complete" in line or " crashed" in line:
+        # Terminal states: "complete" (all cells ran), "halted" (a cell
+        # errored, rest skipped), "crashed" (worker thread blew up).
+        if " complete" in line or " halted" in line or " crashed" in line:
             break
 
     f.close()
@@ -184,11 +189,12 @@ def _format_event(
         m.group("msg"),
     )
 
-    # Filter to events for our job / path.
-    if job_id is not None and f"job {job_id}" not in msg:
-        # Allow path-tagged kernel lifecycle events through too.
-        if not (target_path and target_path in msg):
-            return None
+    # Filter to events for our job / path. Path-tagged kernel lifecycle
+    # events are let through alongside the job's own lines.
+    job_miss = job_id is not None and f"job {job_id}" not in msg
+    path_hit = bool(target_path and target_path in msg)
+    if job_miss and not path_hit:
+        return None
     if job_id is None and target_path is not None and target_path not in msg:
         return None
     if job_id is None and target_path is None:
@@ -208,6 +214,7 @@ def _kill_stray_ipykernels() -> int:
             ["pgrep", "-u", str(os.getuid()), "-f", "ipykernel_launcher"],
             capture_output=True,
             text=True,
+            check=False,
         )
     except FileNotFoundError:
         print("pgrep not available; skipping process kill", file=sys.stderr)
