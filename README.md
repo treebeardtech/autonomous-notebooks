@@ -86,16 +86,4 @@ nb watch --job <id>    # tail the log for one job; exits when it ends (for Monit
 
 ## Contributing
 
-```bash
-git clone https://github.com/treebeardtech/autonomous-notebooks
-cd autonomous-notebooks
-just sync
-just lint   # ruff + pyright + pytest
-```
-
-To test local changes in another project:
-
-```bash
-cd /path/to/your-project
-uv add --dev --editable /path/to/autonomous-notebooks
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the component map and dev loop.
